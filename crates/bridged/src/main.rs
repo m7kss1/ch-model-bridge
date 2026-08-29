@@ -94,16 +94,23 @@ async fn main() -> anyhow::Result<()> {
         metrics,
     };
 
+    // Bound before the socket path is touched: the HTTP port doubles as the
+    // single-instance lock, so a doomed second daemon dies right here instead
+    // of getting anywhere near the live daemon's socket file.
+    let listener = tokio::net::TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("binding {}", args.listen))?;
+
     if let Some(socket) = args.socket {
+        let channel = uds::bind(&socket)?;
         let registry = Arc::clone(&state.registry);
         tokio::spawn(async move {
-            if let Err(e) = uds::serve(socket, registry).await {
+            if let Err(e) = uds::serve(channel, registry).await {
                 tracing::error!("binary channel failed: {e:#}");
             }
         });
     }
 
-    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(listen = %args.listen, models = ?state.registry.names(), "serving");
 
     axum::serve(listener, http::router(state))
