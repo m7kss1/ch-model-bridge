@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use protocol::passport::ModelKind;
 use protocol::wire::{self, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,15 +9,31 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::registry::Registry;
 
+/// Claims the socket path. A file already there is either the socket of a
+/// live daemon — evicting it would silently cut that daemon off from its
+/// clients — or a stale leftover from an unclean exit. Connecting tells the
+/// two apart: a live socket accepts, so this instance must refuse to start;
+/// a stale one refuses, so it is safe to replace.
+pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => bail!(
+            "{}: a running daemon already serves this socket",
+            path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    let listener = UnixListener::bind(path).with_context(|| path.display().to_string())?;
+    tracing::info!(socket = %path.display(), "binary channel listening");
+    Ok(listener)
+}
+
 /// Binary channel for `bridge-client`: one length-prefixed request frame in,
 /// one response frame out. Requests land in the same per-model dispatcher as
 /// HTTP, so batches merge across both channels.
-pub async fn serve(path: PathBuf, registry: Arc<Registry>) -> anyhow::Result<()> {
-    // A previous run's socket file would fail the bind; nothing else may own
-    // this path.
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).with_context(|| path.display().to_string())?;
-    tracing::info!(socket = %path.display(), "binary channel listening");
+pub async fn serve(listener: UnixListener, registry: Arc<Registry>) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let registry = Arc::clone(&registry);

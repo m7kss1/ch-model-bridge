@@ -123,6 +123,7 @@ pub struct DaemonBuilder {
     env: Vec<(String, String)>,
     models_dir: Option<PathBuf>,
     with_socket: bool,
+    listen_port: Option<u16>,
 }
 
 impl Default for DaemonBuilder {
@@ -132,6 +133,7 @@ impl Default for DaemonBuilder {
             env: Vec::new(),
             models_dir: None,
             with_socket: true,
+            listen_port: None,
         }
     }
 }
@@ -162,6 +164,13 @@ impl DaemonBuilder {
         self
     }
 
+    /// Binds this exact port instead of a fresh free one, for tests where the
+    /// port is meant to collide.
+    pub fn listen(mut self, port: u16) -> Self {
+        self.listen_port = Some(port);
+        self
+    }
+
     fn command(&self, dir: &TempDir, port: u16, socket: &Path) -> Command {
         let mut command = Command::new(bin("bridged"));
         command
@@ -189,7 +198,7 @@ impl DaemonBuilder {
     /// Starts the daemon and waits until it answers on both channels.
     pub fn start(self) -> Daemon {
         let dir = TempDir::new("daemon");
-        let port = free_port();
+        let port = self.listen_port.unwrap_or_else(free_port);
         let socket = dir.child("bridge.sock");
         let log = dir.child("bridged.log");
         let file = std::fs::File::create(&log).expect("create log file");
@@ -216,7 +225,7 @@ impl DaemonBuilder {
     /// logged. Used by the fail-close tests.
     pub fn start_expect_failure(self) -> String {
         let dir = TempDir::new("daemon-fail");
-        let port = free_port();
+        let port = self.listen_port.unwrap_or_else(free_port);
         let socket = dir.child("bridge.sock");
         let log = dir.child("bridged.log");
         let file = std::fs::File::create(&log).expect("create log file");

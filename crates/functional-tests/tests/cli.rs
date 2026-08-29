@@ -282,3 +282,54 @@ fn regenerating_overwrites_instead_of_appending() {
     assert_eq!(retuned.matches("<name>localEmbed</name>").count(), 1);
     assert!(retuned.contains("<pool_size>2</pool_size>"));
 }
+
+#[test]
+fn the_default_out_dir_coexists_with_a_clickhouse_binary_in_cwd() {
+    let dir = TempDir::new("cli-out-default");
+    // The official installer drops the binary into the working directory as
+    // `clickhouse` — exactly where gen-configs used to put its output.
+    std::fs::write(dir.child("clickhouse"), b"the database binary").unwrap();
+
+    let run = run_cli(
+        dir.path(),
+        &[
+            "gen-configs",
+            "--client",
+            bin("bridge-client").to_str().unwrap(),
+            "--socket",
+            dir.child("bridge.sock").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "gen-configs failed: {}", run.stderr);
+    assert!(
+        dir.child("bridge-configs")
+            .join("model_bridge_functions.xml")
+            .is_file(),
+        "the default output directory was not written"
+    );
+}
+
+#[test]
+fn a_file_in_the_way_of_out_is_reported_with_the_flag_to_move_it() {
+    let dir = TempDir::new("cli-out-file");
+    std::fs::write(dir.child("taken"), b"not a directory").unwrap();
+
+    let run = run_cli(
+        dir.path(),
+        &[
+            "gen-configs",
+            "--client",
+            bin("bridge-client").to_str().unwrap(),
+            "--socket",
+            dir.child("bridge.sock").to_str().unwrap(),
+            "--out",
+            dir.child("taken").to_str().unwrap(),
+        ],
+    );
+    assert_ne!(run.code, Some(0), "a file in the way must fail the command");
+    assert!(
+        run.stderr.contains("a file is in the way") && run.stderr.contains("--out"),
+        "the error must point at --out:\n{}",
+        run.stderr
+    );
+}

@@ -73,13 +73,13 @@ bridged --socket /tmp/bridge.sock
 model-bridge gen-configs --client "$(which bridge-client)" --socket /tmp/bridge.sock
 ```
 
-It writes a `clickhouse/` directory with two things. `model_bridge_functions.xml` declares the three functions and bakes the socket path from step 2 into each one's command line, that is how the adapter will find the daemon. And `bridge-client` is copied into `clickhouse/scripts/`, because ClickHouse only spawns commands that live inside its own `user_scripts_path`
+It writes a `bridge-configs/` directory with two things. `model_bridge_functions.xml` declares the three functions and bakes the socket path from step 2 into each one's command line, that is how the adapter will find the daemon. And `bridge-client` is copied into `bridge-configs/scripts/`, because ClickHouse only spawns commands that live inside its own `user_scripts_path`
 
 Nobody hands these files to ClickHouse automatically — you do it once. The command prints two config lines with real absolute paths; put them into the ClickHouse server config and reload:
 
 ```xml
-<user_defined_executable_functions_config>/abs/path/clickhouse/model_bridge_functions.xml</user_defined_executable_functions_config>
-<user_scripts_path>/abs/path/clickhouse/scripts</user_scripts_path>
+<user_defined_executable_functions_config>/abs/path/bridge-configs/model_bridge_functions.xml</user_defined_executable_functions_config>
+<user_scripts_path>/abs/path/bridge-configs/scripts</user_scripts_path>
 ```
 
 From that reload ClickHouse knows the functions. When a query calls one, ClickHouse itself spawns `bridge-client` from the scripts directory, and the adapter connects to the daemon's socket — the circle closes
