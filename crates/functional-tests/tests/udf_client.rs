@@ -114,6 +114,116 @@ fn every_block_is_answered_before_the_next_one_arrives() {
     assert!(status.success(), "client exited with {status}");
 }
 
+/// A long-lived `bridge-client` with its pipes held open, standing in for one
+/// process of the ClickHouse pool across the restart tests.
+struct PooledClient {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+}
+
+fn spawn_pooled_client(socket: &std::path::Path) -> PooledClient {
+    let mut child = Command::new(bin("bridge-client"))
+        .arg("embed")
+        .arg("--socket")
+        .arg(socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bridge-client");
+
+    // A client stuck retrying forever must fail the test, not hang it.
+    let pid = child.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
+
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    PooledClient {
+        child,
+        stdin,
+        stdout,
+    }
+}
+
+impl PooledClient {
+    fn send_block(&mut self, text: &str) {
+        let block = rowbinary::block(&[embed_row("stub", text)]);
+        self.stdin.write_all(&block).expect("write block");
+        self.stdin.flush().expect("flush block");
+    }
+
+    fn read_vector(&mut self) -> Vec<f32> {
+        let mut reply = vec![0u8; row_size(384)];
+        self.stdout.read_exact(&mut reply).expect("read reply");
+        rowbinary::read_f32_arrays(&reply, 1).remove(0)
+    }
+
+    fn finish(self) {
+        let PooledClient {
+            mut child, stdin, ..
+        } = self;
+        drop(stdin);
+        let status = child.wait().expect("wait for bridge-client");
+        assert!(status.success(), "client exited with {status}");
+    }
+}
+
+#[test]
+fn the_pooled_process_survives_a_daemon_restart() {
+    // Restarting the daemon is the normal way to pick up changed models; the
+    // warmed-up pool must carry on over a fresh connection instead of dying
+    // with the old one and taking queries down until ClickHouse respawns it.
+    let mut daemon = Daemon::stub();
+    let mut client = spawn_pooled_client(daemon.socket());
+
+    client.send_block("before the restart");
+    assert_eq!(client.read_vector().len(), 384);
+
+    daemon.restart();
+
+    client.send_block("after the restart");
+    assert_eq!(client.read_vector().len(), 384);
+    client.finish();
+}
+
+#[test]
+fn a_block_sent_during_an_outage_is_answered_once_the_daemon_returns() {
+    let mut daemon = Daemon::stub();
+    let mut client = spawn_pooled_client(daemon.socket());
+
+    client.send_block("warm up the connection");
+    assert_eq!(client.read_vector().len(), 384);
+
+    daemon.stop();
+    client.send_block("sent into the outage");
+    // Long enough for the client to hit the dead socket and start retrying.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    daemon.restart();
+
+    assert_eq!(client.read_vector().len(), 384);
+    client.finish();
+}
+
+#[test]
+fn a_client_spawned_during_an_outage_waits_for_the_daemon() {
+    // ClickHouse may spawn a pool process while the daemon is mid-restart;
+    // the process must wait out the outage, not die on arrival.
+    let mut daemon = Daemon::stub();
+    daemon.stop();
+
+    let mut client = spawn_pooled_client(daemon.socket());
+    client.send_block("spawned before the daemon was back");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    daemon.restart();
+
+    assert_eq!(client.read_vector().len(), 384);
+    client.finish();
+}
+
 #[test]
 fn an_empty_block_produces_no_rows() {
     let daemon = Daemon::stub();
@@ -130,18 +240,32 @@ fn end_of_input_without_a_block_is_a_clean_exit() {
 
 #[test]
 fn a_missing_daemon_fails_the_query_with_the_socket_path() {
+    // The retry window exists for restarts; a daemon that never comes back
+    // must still fail the query, naming the socket it waited for. This test
+    // sits out the whole window by design.
     let socket = std::path::Path::new("/tmp/model-bridge-does-not-exist.sock");
-    let run = functional_tests::run_bridge_client("embed", socket, b"0\n");
+    let block = rowbinary::block(&[embed_row("stub", "text")]);
+    let run = functional_tests::run_bridge_client("embed", socket, &block);
     let stderr = run.expect_failure();
 
     assert!(
-        stderr.contains("bridge-client: connecting to the daemon at"),
+        stderr.contains("bridge-client: daemon at")
+            && stderr.contains("still unreachable after retrying"),
         "unhelpful stderr: {stderr}"
     );
     assert!(
         stderr.contains("model-bridge-does-not-exist.sock"),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_block_without_rows_does_not_need_the_daemon() {
+    // The connection is opened on demand and a block of zero rows makes no
+    // requests, so it succeeds even when nobody serves the socket.
+    let socket = std::path::Path::new("/tmp/model-bridge-does-not-exist.sock");
+    let stdout = functional_tests::run_bridge_client("embed", socket, b"0\n").expect_success();
+    assert!(stdout.is_empty());
 }
 
 #[test]

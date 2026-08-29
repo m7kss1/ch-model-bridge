@@ -332,6 +332,8 @@ fn an_unknown_model_fails_the_query() {
 
 #[test]
 fn a_stopped_daemon_fails_the_query_instead_of_returning_rows() {
+    // The client retries for ten seconds in case the daemon is restarting,
+    // so this test waits out the whole window before the failure surfaces.
     require_clickhouse!();
     require_model!(E5);
     let mut cluster = Cluster::start(&[(E5, "embedding")]);
@@ -339,7 +341,7 @@ fn a_stopped_daemon_fails_the_query_instead_of_returning_rows() {
 
     let stderr = cluster.query_fails(&format!("SELECT localEmbed('{E5}', 'text')"));
     assert!(
-        stderr.contains("connecting to the daemon at"),
+        stderr.contains("daemon at") && stderr.contains("still unreachable after retrying"),
         "a dead daemon must fail the query loudly:\n{stderr}"
     );
 }
