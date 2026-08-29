@@ -6,14 +6,19 @@
 //! as a decimal row count terminated by `\n`, then that many rows. The reply
 //! must contain exactly as many result rows, flushed before the next header
 //! is read.
+//!
+//! Every row the database scans crosses this process, so nothing here copies
+//! a row it does not have to: rows are read once, handed to the encoder by
+//! reference, and the frames are buffers the process reuses for its lifetime.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use protocol::wire::{self, Request, Response};
+use protocol::wire::{self, Response};
 
 enum Mode {
     /// Rows of (model, text) -> one `Array(Float32)` per row.
@@ -23,6 +28,9 @@ enum Mode {
     /// Rows of (model, features `Array(Float64)`) -> one `Float32` per row.
     /// Features arrive as `Float64` because that is what ClickHouse float
     /// expressions produce; they are narrowed to the model's float32 here.
+    /// The UDF cannot declare `Array(Float32)` and let the database narrow:
+    /// its argument cast is an accurate one, and it refuses every value
+    /// float32 cannot hold exactly — 0.1 included.
     Evaluate,
 }
 
@@ -37,8 +45,7 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let (mode, socket) = parse_args()?;
-    let mut daemon = UnixStream::connect(&socket)
-        .with_context(|| format!("connecting to the daemon at {}", socket.display()))?;
+    let mut channel = Channel::connect(&socket)?;
 
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
@@ -47,89 +54,102 @@ fn run() -> anyhow::Result<()> {
 
     while let Some(rows) = read_chunk_header(&mut input)? {
         match mode {
-            Mode::Embed => {
-                let mut models = Vec::with_capacity(rows);
-                let mut texts = Vec::with_capacity(rows);
-                for _ in 0..rows {
-                    models.push(read_string(&mut input)?);
-                    texts.push(read_string(&mut input)?);
-                }
-                let results = embed_rows(&mut daemon, &models, texts)?;
-                for vector in results {
-                    write_varuint(&mut output, vector.len() as u64)?;
-                    for value in vector {
-                        output.write_all(&value.to_le_bytes())?;
-                    }
-                }
-            }
-            Mode::Rerank => {
-                let mut models = Vec::with_capacity(rows);
-                let mut pairs = Vec::with_capacity(rows);
-                for _ in 0..rows {
-                    models.push(read_string(&mut input)?);
-                    let query = read_string(&mut input)?;
-                    let document = read_string(&mut input)?;
-                    pairs.push((query, document));
-                }
-                let scores = rerank_rows(&mut daemon, &models, pairs)?;
-                for score in scores {
-                    output.write_all(&score.to_le_bytes())?;
-                }
-            }
-            Mode::Evaluate => {
-                let mut models = Vec::with_capacity(rows);
-                let mut features = Vec::with_capacity(rows);
-                for _ in 0..rows {
-                    models.push(read_string(&mut input)?);
-                    features.push(read_f32_array(&mut input)?);
-                }
-                let scores = evaluate_rows(&mut daemon, &models, features)?;
-                for score in scores {
-                    output.write_all(&score.to_le_bytes())?;
-                }
-            }
+            Mode::Embed => embed_block(&mut channel, &mut input, &mut output, rows)?,
+            Mode::Rerank => rerank_block(&mut channel, &mut input, &mut output, rows)?,
+            Mode::Evaluate => evaluate_block(&mut channel, &mut input, &mut output, rows)?,
         }
         output.flush()?;
     }
     Ok(())
 }
 
+/// The daemon connection and the two frame buffers. ClickHouse keeps a pooled
+/// client alive across many blocks, so both grow once to the size of the
+/// largest block and never allocate again.
+struct Channel {
+    daemon: UnixStream,
+    request: Vec<u8>,
+    reply: Vec<u8>,
+}
+
+impl Channel {
+    fn connect(socket: &Path) -> anyhow::Result<Self> {
+        let daemon = UnixStream::connect(socket)
+            .with_context(|| format!("connecting to the daemon at {}", socket.display()))?;
+        Ok(Self {
+            daemon,
+            request: Vec::new(),
+            reply: Vec::new(),
+        })
+    }
+
+    /// Sends whatever the caller encoded into `request` and decodes the answer.
+    fn round_trip(&mut self) -> anyhow::Result<Response> {
+        self.daemon
+            .write_all(&(self.request.len() as u32).to_le_bytes())?;
+        self.daemon.write_all(&self.request)?;
+
+        let mut len_buf = [0u8; 4];
+        self.daemon
+            .read_exact(&mut len_buf)
+            .context("daemon closed the connection")?;
+        let len = u32::from_le_bytes(len_buf);
+        if len > wire::MAX_FRAME {
+            bail!("daemon sent a frame of {len} bytes, over the limit");
+        }
+        self.reply.resize(len as usize, 0);
+        self.daemon.read_exact(&mut self.reply)?;
+        wire::decode_response(&self.reply).map_err(|e| anyhow!("bad response frame: {e}"))
+    }
+}
+
 /// The model name is a per-row argument in SQL, but it is almost always a
 /// constant within a block; rows are grouped so each distinct model costs one
-/// daemon round-trip.
-fn group_by_model(models: &[String]) -> Vec<(String, Vec<usize>)> {
-    let mut order: Vec<String> = Vec::new();
+/// daemon round-trip. The groups borrow the names — a block of one model
+/// copies nothing at all.
+fn group_by_model(models: &[String]) -> Vec<(&str, Vec<usize>)> {
+    let mut order: Vec<&str> = Vec::new();
     let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, model) in models.iter().enumerate() {
-        if !groups.contains_key(model.as_str()) {
-            order.push(model.clone());
+        match groups.entry(model.as_str()) {
+            Entry::Occupied(mut group) => group.get_mut().push(index),
+            Entry::Vacant(slot) => {
+                order.push(model.as_str());
+                slot.insert(vec![index]);
+            }
         }
-        groups.entry(model).or_default().push(index);
     }
     order
         .into_iter()
         .map(|model| {
-            let indices = groups.remove(model.as_str()).unwrap_or_default();
+            let indices = groups.remove(model).unwrap_or_default();
             (model, indices)
         })
         .collect()
 }
 
-fn embed_rows(
-    daemon: &mut UnixStream,
-    models: &[String],
-    texts: Vec<String>,
-) -> anyhow::Result<Vec<Vec<f32>>> {
-    let mut results: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
-    for (model, indices) in group_by_model(models) {
-        let group_texts: Vec<String> = indices.iter().map(|&i| texts[i].clone()).collect();
-        let response = round_trip(
-            daemon,
-            &Request::Embed {
-                model: model.clone(),
-                texts: group_texts,
-            },
-        )?;
+fn embed_block(
+    channel: &mut Channel,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    rows: usize,
+) -> anyhow::Result<()> {
+    let mut models = Vec::with_capacity(rows);
+    let mut texts = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        models.push(read_string(input)?);
+        texts.push(read_string(input)?);
+    }
+
+    // Answers arrive one flat buffer per model group. Rather than cutting them
+    // into a vector per row, each row remembers the group its embedding landed
+    // in and the offset there, and is written straight out of that buffer.
+    let mut answers: Vec<(usize, Vec<f32>)> = Vec::new();
+    let mut placement = vec![(0usize, 0usize); rows];
+    for (model, indices) in group_by_model(&models) {
+        let group: Vec<&str> = indices.iter().map(|&index| texts[index].as_str()).collect();
+        wire::encode_embed(model, &group, &mut channel.request);
+        let response = channel.round_trip()?;
         let Response::Embed { dim, vectors } = response else {
             bail!("daemon: {}", response_error(response));
         };
@@ -141,89 +161,126 @@ fn embed_rows(
                 indices.len()
             );
         }
-        for (slot, chunk) in indices.iter().zip(vectors.chunks_exact(dim)) {
-            results[*slot] = chunk.to_vec();
+        for (position, &row) in indices.iter().enumerate() {
+            placement[row] = (answers.len(), position * dim);
+        }
+        answers.push((dim, vectors));
+    }
+
+    for (answer, offset) in placement {
+        let (dim, vectors) = &answers[answer];
+        write_varuint(output, *dim as u64)?;
+        for value in &vectors[offset..offset + *dim] {
+            output.write_all(&value.to_le_bytes())?;
         }
     }
-    Ok(results)
+    Ok(())
 }
 
-fn rerank_rows(
-    daemon: &mut UnixStream,
-    models: &[String],
-    pairs: Vec<(String, String)>,
-) -> anyhow::Result<Vec<f32>> {
-    let mut results = vec![0f32; pairs.len()];
-    for (model, indices) in group_by_model(models) {
-        let group_pairs: Vec<(String, String)> =
-            indices.iter().map(|&i| pairs[i].clone()).collect();
-        let response = round_trip(
-            daemon,
-            &Request::Rerank {
-                model: model.clone(),
-                pairs: group_pairs,
-            },
-        )?;
-        let Response::Rerank { scores } = response else {
+fn rerank_block(
+    channel: &mut Channel,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    rows: usize,
+) -> anyhow::Result<()> {
+    let mut models = Vec::with_capacity(rows);
+    let mut pairs = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        models.push(read_string(input)?);
+        let query = read_string(input)?;
+        let document = read_string(input)?;
+        pairs.push((query, document));
+    }
+
+    let mut scores = vec![0f32; rows];
+    for (model, indices) in group_by_model(&models) {
+        let group: Vec<(&str, &str)> = indices
+            .iter()
+            .map(|&index| {
+                let (query, document) = &pairs[index];
+                (query.as_str(), document.as_str())
+            })
+            .collect();
+        wire::encode_rerank(model, &group, &mut channel.request);
+        let response = channel.round_trip()?;
+        let Response::Rerank { scores: answer } = response else {
             bail!("daemon: {}", response_error(response));
         };
-        if scores.len() != indices.len() {
+        if answer.len() != indices.len() {
             bail!(
                 "daemon returned {} scores for {} pairs",
-                scores.len(),
+                answer.len(),
                 indices.len()
             );
         }
-        for (slot, score) in indices.iter().zip(scores) {
-            results[*slot] = score;
+        for (&slot, score) in indices.iter().zip(answer) {
+            scores[slot] = score;
         }
     }
-    Ok(results)
+
+    for score in scores {
+        output.write_all(&score.to_le_bytes())?;
+    }
+    Ok(())
 }
 
-fn evaluate_rows(
-    daemon: &mut UnixStream,
-    models: &[String],
-    features: Vec<Vec<f32>>,
-) -> anyhow::Result<Vec<f32>> {
-    let mut results = vec![0f32; features.len()];
-    for (model, indices) in group_by_model(models) {
+fn evaluate_block(
+    channel: &mut Channel,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    rows: usize,
+) -> anyhow::Result<()> {
+    let mut models = Vec::with_capacity(rows);
+    // Feature rows go into one buffer with `starts` marking where each begins,
+    // so a row is a slice of it rather than a vector of its own.
+    let mut values: Vec<f32> = Vec::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(rows + 1);
+    for _ in 0..rows {
+        models.push(read_string(input)?);
+        starts.push(values.len());
+        read_narrowed_array(input, &mut values)?;
+    }
+    starts.push(values.len());
+
+    let mut scores = vec![0f32; rows];
+    let mut group: Vec<f32> = Vec::new();
+    for (model, indices) in group_by_model(&models) {
         // The daemon takes a rectangular matrix per request; ragged feature
         // arrays within one model are a caller bug worth naming precisely.
-        let n_features = features[indices[0]].len();
-        let mut values = Vec::with_capacity(indices.len() * n_features);
+        let n_features = starts[indices[0] + 1] - starts[indices[0]];
+        group.clear();
+        group.reserve(indices.len() * n_features);
         for &index in &indices {
-            if features[index].len() != n_features {
+            let row = &values[starts[index]..starts[index + 1]];
+            if row.len() != n_features {
                 bail!(
                     "row {index} has {} features while an earlier `{model}` row has {n_features}",
-                    features[index].len()
+                    row.len()
                 );
             }
-            values.extend_from_slice(&features[index]);
+            group.extend_from_slice(row);
         }
-        let response = round_trip(
-            daemon,
-            &Request::Evaluate {
-                model: model.clone(),
-                n_features: n_features as u32,
-                values,
-            },
-        )?;
-        let Response::Evaluate { scores } = response else {
+        wire::encode_evaluate(model, n_features as u32, &group, &mut channel.request);
+        let response = channel.round_trip()?;
+        let Response::Evaluate { scores: answer } = response else {
             bail!("daemon: {}", response_error(response));
         };
-        if scores.len() != indices.len() {
+        if answer.len() != indices.len() {
             bail!(
                 "daemon returned {} scores for {} rows",
-                scores.len(),
+                answer.len(),
                 indices.len()
             );
         }
-        for (slot, score) in indices.iter().zip(scores) {
-            results[*slot] = score;
+        for (&slot, score) in indices.iter().zip(answer) {
+            scores[slot] = score;
         }
     }
-    Ok(results)
+
+    for score in scores {
+        output.write_all(&score.to_le_bytes())?;
+    }
+    Ok(())
 }
 
 fn response_error(response: Response) -> String {
@@ -231,24 +288,6 @@ fn response_error(response: Response) -> String {
         Response::Error(message) => message,
         _ => "unexpected response kind".to_string(),
     }
-}
-
-fn round_trip(daemon: &mut UnixStream, request: &Request) -> anyhow::Result<Response> {
-    let payload = wire::encode_request(request);
-    daemon.write_all(&(payload.len() as u32).to_le_bytes())?;
-    daemon.write_all(&payload)?;
-
-    let mut len_buf = [0u8; 4];
-    daemon
-        .read_exact(&mut len_buf)
-        .context("daemon closed the connection")?;
-    let len = u32::from_le_bytes(len_buf);
-    if len > wire::MAX_FRAME {
-        bail!("daemon sent a frame of {len} bytes, over the limit");
-    }
-    let mut payload = vec![0u8; len as usize];
-    daemon.read_exact(&mut payload)?;
-    wire::decode_response(&payload).map_err(|e| anyhow!("bad response frame: {e}"))
 }
 
 fn parse_args() -> anyhow::Result<(Mode, PathBuf)> {
@@ -307,16 +346,16 @@ fn write_varuint(output: &mut impl Write, mut value: u64) -> anyhow::Result<()> 
 }
 
 /// A `RowBinary` `Array(Float64)` is a LEB128 element count followed by the
-/// elements as `f64` little-endian; values are narrowed to `f32` on read.
-fn read_f32_array(input: &mut impl Read) -> anyhow::Result<Vec<f32>> {
-    let len = read_varuint(input)? as usize;
-    let mut values = Vec::with_capacity(len.min(1 << 20));
+/// elements as `f64` little-endian; they are narrowed to the model's float32
+/// as they are appended to `out`.
+fn read_narrowed_array(input: &mut impl Read, out: &mut Vec<f32>) -> anyhow::Result<()> {
+    let len = read_varuint(input)?;
     for _ in 0..len {
         let mut bytes = [0u8; 8];
         input.read_exact(&mut bytes)?;
-        values.push(f64::from_le_bytes(bytes) as f32);
+        out.push(f64::from_le_bytes(bytes) as f32);
     }
-    Ok(values)
+    Ok(())
 }
 
 fn read_string(input: &mut impl Read) -> anyhow::Result<String> {
@@ -325,5 +364,7 @@ fn read_string(input: &mut impl Read) -> anyhow::Result<String> {
     input.read_exact(&mut bytes)?;
     // A ClickHouse `String` is raw bytes; the tokenizer needs UTF-8, so
     // invalid sequences are replaced rather than failing the whole block.
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    // Valid bytes — all of them, in practice — become the string in place.
+    Ok(String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }

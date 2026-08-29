@@ -61,46 +61,75 @@ pub mod wire {
         Error(String),
     }
 
+    /// Encodes an embed request into `out`, replacing its contents. Texts are
+    /// borrowed and the buffer is the caller's: the thin client encodes
+    /// straight from the rows it read, into a frame it reuses for every block.
+    pub fn encode_embed(model: &str, texts: &[&str], out: &mut Vec<u8>) {
+        let payload = texts.iter().map(|text| 4 + text.len()).sum();
+        start(out, TASK_EMBED, model, texts.len() as u32, payload);
+        for text in texts {
+            put_str(out, text);
+        }
+    }
+
+    /// Encodes a rerank request into `out`, replacing its contents.
+    pub fn encode_rerank(model: &str, pairs: &[(&str, &str)], out: &mut Vec<u8>) {
+        let payload = pairs
+            .iter()
+            .map(|(query, document)| 8 + query.len() + document.len())
+            .sum();
+        start(out, TASK_RERANK, model, pairs.len() as u32, payload);
+        for (query, document) in pairs {
+            put_str(out, query);
+            put_str(out, document);
+        }
+    }
+
+    /// Encodes an evaluate request into `out`, replacing its contents.
+    /// `values` is the row-major feature matrix; `n_features` recovers the row
+    /// boundaries.
+    pub fn encode_evaluate(model: &str, n_features: u32, values: &[f32], out: &mut Vec<u8>) {
+        let rows = (values.len() as u32).checked_div(n_features).unwrap_or(0);
+        start(out, TASK_EVALUATE, model, rows, 4 + values.len() * 4);
+        out.extend_from_slice(&n_features.to_le_bytes());
+        put_f32s(out, values);
+    }
+
+    /// For callers that already hold an owned request — the daemon's own
+    /// tests, mostly. Hot paths use the borrowed encoders above.
     pub fn encode_request(request: &Request) -> Vec<u8> {
-        let mut out = vec![PROTOCOL_VERSION];
+        let mut out = Vec::new();
         match request {
             Request::Embed { model, texts } => {
-                out.push(TASK_EMBED);
-                put_str(&mut out, model);
-                out.extend((texts.len() as u32).to_le_bytes());
-                for text in texts {
-                    put_str(&mut out, text);
-                }
+                let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+                encode_embed(model, &texts, &mut out);
             }
             Request::Rerank { model, pairs } => {
-                out.push(TASK_RERANK);
-                put_str(&mut out, model);
-                out.extend((pairs.len() as u32).to_le_bytes());
-                for (query, document) in pairs {
-                    put_str(&mut out, query);
-                    put_str(&mut out, document);
-                }
+                let pairs: Vec<(&str, &str)> = pairs
+                    .iter()
+                    .map(|(query, document)| (query.as_str(), document.as_str()))
+                    .collect();
+                encode_rerank(model, &pairs, &mut out);
             }
             Request::Evaluate {
                 model,
                 n_features,
                 values,
-            } => {
-                out.push(TASK_EVALUATE);
-                put_str(&mut out, model);
-                let rows = if *n_features == 0 {
-                    0
-                } else {
-                    values.len() as u32 / n_features
-                };
-                out.extend(rows.to_le_bytes());
-                out.extend(n_features.to_le_bytes());
-                for value in values {
-                    out.extend(value.to_le_bytes());
-                }
-            }
+            } => encode_evaluate(model, *n_features, values, &mut out),
         }
         out
+    }
+
+    /// The head every request shares — version, task kind, model name, item
+    /// count — with room for `payload` more bytes taken in one go, so a reused
+    /// buffer stops reallocating after the first block.
+    fn start(out: &mut Vec<u8>, task: u8, model: &str, count: u32, payload: usize) {
+        out.clear();
+        out.reserve(2 + 4 + model.len() + 4 + payload);
+        out.push(PROTOCOL_VERSION);
+        out.push(task);
+        put_str(out, model);
+        out.extend_from_slice(&count.to_le_bytes());
     }
 
     pub fn decode_request(payload: &[u8]) -> Result<Request, String> {
@@ -158,25 +187,19 @@ pub mod wire {
                 out.push(TASK_EMBED);
                 out.extend(dim.to_le_bytes());
                 out.extend((vectors.len() as u32).to_le_bytes());
-                for value in vectors {
-                    out.extend(value.to_le_bytes());
-                }
+                put_f32s(&mut out, vectors);
             }
             Response::Rerank { scores } => {
                 out.push(STATUS_OK);
                 out.push(TASK_RERANK);
                 out.extend((scores.len() as u32).to_le_bytes());
-                for value in scores {
-                    out.extend(value.to_le_bytes());
-                }
+                put_f32s(&mut out, scores);
             }
             Response::Evaluate { scores } => {
                 out.push(STATUS_OK);
                 out.push(TASK_EVALUATE);
                 out.extend((scores.len() as u32).to_le_bytes());
-                for value in scores {
-                    out.extend(value.to_le_bytes());
-                }
+                put_f32s(&mut out, scores);
             }
             Response::Error(message) => {
                 out.push(STATUS_ERROR);
@@ -224,6 +247,15 @@ pub mod wire {
     fn put_str(out: &mut Vec<u8>, value: &str) {
         out.extend((value.len() as u32).to_le_bytes());
         out.extend(value.as_bytes());
+    }
+
+    /// A block of embeddings runs to hundreds of megabytes; growing the buffer
+    /// four bytes at a time would recopy all of it on the way.
+    fn put_f32s(out: &mut Vec<u8>, values: &[f32]) {
+        out.reserve(values.len() * 4);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
     }
 
     struct Cursor<'a> {

@@ -163,7 +163,8 @@ fn gen_configs_declares_the_three_sql_functions() {
     );
 
     // modelEvaluate takes Float64 because that is what ClickHouse float
-    // expressions produce; the client narrows.
+    // expressions produce, and its accurate argument cast refuses to narrow
+    // them; the client narrows instead.
     assert!(xml.contains("<argument><type>Array(Float64)</type><name>features</name></argument>"));
     assert!(xml.contains("<argument><type>String</type><name>document</name></argument>"));
 }
