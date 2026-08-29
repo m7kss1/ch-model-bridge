@@ -1,0 +1,61 @@
+# Everything this project pins is pinned deliberately — crates by lockfile,
+# actions by commit sha, base images by digest — so something has to unpin it
+# on a schedule. Updates are grouped: one review a week beats ten.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    # Workflows live at the root; the composite actions each count as their
+    # own manifest and would be missed otherwise.
+    directories:
+      - "/"
+      - "/.github/actions/downloaded-models"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # The pinned packages behind the tabular demo. The CI model cache key hashes
+  # the requirements file, so a bump retrains the demo model and regenerates
+  # the reference scores together.
+  - package-ecosystem: pip
+    directory: "/examples"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    groups:
+      python:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  # Keeps the digest-pinned builder and runtime bases current, which is where
+  # base-image CVEs get fixed.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    commit-message:
+      prefix: "image"

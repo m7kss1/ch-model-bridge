@@ -1,0 +1,22 @@
+[package]
+name = "bridged"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "clickhouse-model-bridge daemon"
+publish = false
+
+[dependencies]
+protocol = { path = "../protocol", features = ["passport"] }
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+lru = "0.18.3"
+ort = "2.0.0-rc.13"
+serde.workspace = true
+serde_json.workspace = true
+tokenizers = "0.23.1"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

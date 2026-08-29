@@ -1,0 +1,19 @@
+[package]
+name = "bridge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Administrator CLI: fetch models, manage the registry, generate UDF configs"
+publish = false
+
+[[bin]]
+name = "model-bridge"
+path = "src/main.rs"
+
+[dependencies]
+protocol = { path = "../protocol", features = ["passport"] }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+ureq = "3.4.0"

@@ -1,0 +1,61 @@
+# Supply-chain policy, enforced by `cargo deny check` in CI. The daemon runs on
+# a database host and is meant to work air-gapped, so what may enter the
+# dependency tree is a deliberate decision, not whatever cargo resolved.
+
+[graph]
+# The platforms the project ships for; advisories and bans are evaluated for
+# these, so a Windows-only dependency cannot fail a build that never uses it.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+# A published advisory against a dependency should fail the build. When one
+# genuinely does not apply, record the id here with the reason instead of
+# lowering the gate.
+yanked = "deny"
+ignore = [
+    # `paste` is archived upstream and reachable only through `tokenizers`,
+    # which has no release that drops it. It is a compile-time macro helper
+    # with no runtime surface, so the exposure is a stalled dependency rather
+    # than a vulnerability. Revisit when tokenizers replaces it.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# Permissive licences only: this is Apache-2.0 software that people vendor
+# into their own infrastructure.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MITNFA",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+# Duplicate versions are noise more often than a problem, but a wildcard
+# dependency makes a build unreproducible.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace crates depend on each other by path and are never published,
+# so their missing version requirement is not a wildcard in any real sense.
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+# Only crates.io. A git dependency would break offline and reproducible
+# builds, and nothing here needs one.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
