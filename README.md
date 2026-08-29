@@ -82,7 +82,7 @@ Nobody hands these files to ClickHouse automatically — you do it once. The com
 <user_scripts_path>/abs/path/bridge-configs/scripts</user_scripts_path>
 ```
 
-From that reload ClickHouse knows the functions. When a query calls one, ClickHouse itself spawns `bridge-client` from the scripts directory, and the adapter connects to the daemon's socket — the circle closes
+From that reload ClickHouse knows the functions. When a query calls one, ClickHouse itself spawns `bridge-client` from the scripts directory, and the adapter connects to the daemon's socket — the circle closes. The adapter opens that connection on demand and reopens it whenever it breaks, so restarting the daemon — which is how a model gets updated — makes queries in flight wait out the restart, up to ten seconds, instead of failing them, and the pool of warmed-up adapter processes survives untouched
 
 **4. Verify.**
 
