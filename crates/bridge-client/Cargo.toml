@@ -1,0 +1,12 @@
+[package]
+name = "bridge-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Thin executable-UDF client: pipes rows between ClickHouse and the daemon"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+protocol = { path = "../protocol" }

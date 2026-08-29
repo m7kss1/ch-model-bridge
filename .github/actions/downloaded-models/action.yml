@@ -1,0 +1,40 @@
+name: Downloaded models
+description: >
+  Restores the ONNX models the model-backed tiers need. The catalog models are
+  cached by the catalog itself; the tabular demo is trained on a cache miss,
+  which also regenerates the reference scores the regression compares against.
+
+runs:
+  using: composite
+  steps:
+    - name: cache the catalog models
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          models/multilingual-e5-small
+          models/bge-reranker-base
+        # The catalog, with its pinned upstream checksums, lives in the CLI.
+        key: catalog-models-${{ hashFiles('crates/bridge-cli/src/main.rs') }}
+
+    - name: cache the tabular demo model
+      id: tabular
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          models/fraud-demo
+          tmp/fraud-expected.json
+        key: tabular-model-${{ hashFiles('examples/train_fraud_model.py', 'examples/requirements.txt') }}
+
+    - name: train the tabular demo model
+      if: steps.tabular.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # A virtualenv rather than the system interpreter: recent Ubuntu images
+        # refuse `pip install` into an externally managed environment.
+        python3 -m venv .cache/venv
+        .cache/venv/bin/pip install --quiet --disable-pip-version-check \
+            -r examples/requirements.txt
+        # The script writes both the model and the reference scores the
+        # regression test checks the daemon against.
+        .cache/venv/bin/python examples/train_fraud_model.py

@@ -1,0 +1,15 @@
+[package]
+name = "functional-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Black-box functional and regression suite: drives the built binaries the way ClickHouse does"
+
+[dependencies]
+# The wire protocol is part of the contract under test, so the harness speaks
+# it directly instead of reimplementing it. Nothing else from the workspace is
+# linked: the daemon and the clients are spawned as processes.
+protocol = { path = "../protocol", features = ["passport"] }
+serde_json.workspace = true

@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  schedule:
+    # Advisories get published against dependencies that did not change, so the
+    # supply-chain job also runs on its own once a week.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+# Read-only by default. No job here needs more; the release workflow asks for
+# what it needs where it needs it.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Pinned so a new stable release cannot turn an unrelated pull request red.
+  # Bump together with the builder image in the Dockerfile.
+  RUST_VERSION: "1.98.0"
+  # Bump together with the pinned version and checksums in
+  # scripts/functional-tests.sh.
+  CLICKHOUSE_VERSION: "26.7.5.10"
+
+jobs:
+  lint:
+    name: rustfmt + clippy
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: functional tests
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The catalog models are cached; the tabular demo is trained on a cache
+      # miss, which also regenerates the reference scores.
+      - uses: ./.github/actions/downloaded-models
+      - name: cache the ClickHouse binary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/clickhouse-${{ env.CLICKHOUSE_VERSION }}
+          key: clickhouse-${{ runner.arch }}-${{ env.CLICKHOUSE_VERSION }}
+      # One release build, then every tier against those binaries — the same
+      # script and the same path a developer runs locally.
+      - run: scripts/functional-tests.sh --tier all --fetch
+
+  image:
+    name: image build + smoke test
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: build the image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          tags: ch-model-bridge:ci
+          provenance: false
+          cache-from: type=gha
+          # Only main writes the layer cache: pull requests read it, so a busy
+          # week of branches cannot evict it.
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
+      - run: scripts/smoke-test.sh ch-model-bridge:ci
+
+  supply-chain:
+    name: advisories, licences, sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check all
+
+  # One required check for branch protection: it fails if anything above did.
+  ci:
+    name: ci
+    if: always()
+    needs: [lint, test, image, supply-chain]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: check the results
+        run: |
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "job results: $results"
+          case "$results" in
+            *failure*|*cancelled*) echo "::error::a required job did not pass"; exit 1 ;;
+          esac

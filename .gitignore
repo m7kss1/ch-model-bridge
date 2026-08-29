@@ -1,0 +1,9 @@
+/target
+/tmp
+/models
+*.log
+/.cache
+# Generated at setup and machine-specific: passports record absolute model
+# paths, and gen-configs writes configs and copies a built binary here.
+/models.d
+/clickhouse

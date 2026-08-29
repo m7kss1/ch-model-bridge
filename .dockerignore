@@ -1,0 +1,7 @@
+# Deny everything, then allow exactly what the build needs. The repository also
+# holds model weights (hundreds of MB) and a Python venv under tmp/; an
+# allowlist keeps them out of the build context by construction.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
