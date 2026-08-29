@@ -82,7 +82,51 @@ fn a_tabular_passport_covers_the_graph_alone() {
         "a tabular model has no tokenizer, so the passport must not claim one"
     );
     assert_eq!(passport.revision, 1, "the default revision");
-    assert_eq!(passport.max_batch, 64, "the default batch size");
+    assert_eq!(
+        passport.max_batch, None,
+        "no pinned batch size; the daemon resolves it by kind"
+    );
+    assert_eq!(
+        passport.effective_max_batch(),
+        65536,
+        "a tabular model defaults to whole ClickHouse blocks: a tree ensemble \
+         scores 65k rows in one ONNX call"
+    );
+}
+
+#[test]
+fn an_unspecified_passport_resolves_text_model_defaults() {
+    let dir = TempDir::new("cli-defaults");
+    let model = model_dir(&dir, "text");
+    let passports = dir.child("models.d");
+    std::fs::create_dir_all(&passports).unwrap();
+
+    let run = run_cli(
+        dir.path(),
+        &[
+            "passport",
+            model.to_str().unwrap(),
+            "--name",
+            "text",
+            "--kind",
+            "embedding",
+            "--passports",
+            passports.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+
+    let passport = Passport::load(&passports.join("text.toml")).unwrap();
+    assert_eq!(passport.max_batch, None);
+    assert_eq!(passport.sessions, None);
+    assert_eq!(passport.max_tokens, None);
+    assert_eq!(
+        passport.effective_max_batch(),
+        64,
+        "text models keep the modest batch: padding to the longest member \
+         makes huge batches waste positions"
+    );
+    assert_eq!(passport.effective_sessions(), 1);
 }
 
 #[test]
