@@ -700,12 +700,9 @@ fn run_with_stdin(command: &mut Command, stdin: &[u8]) -> ClientRun {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn process");
-    child
-        .stdin
-        .take()
-        .expect("stdin pipe")
-        .write_all(stdin)
-        .expect("write stdin");
+    if let Err(e) = child.stdin.take().expect("stdin pipe").write_all(stdin) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "write stdin: {e}");
+    }
     let output = child.wait_with_output().expect("wait for process");
     ClientRun {
         code: output.status.code(),
