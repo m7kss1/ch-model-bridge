@@ -352,17 +352,16 @@ fn gen_configs(client: &Path, socket: &Path, out: &Path, tuning: &UdfTuning) -> 
             ],
             "rerank",
         ),
-        // Float64, though the models run on float32 and the client narrows:
+        // Float32 is the width the models run on, so that is what the pipe
+        // carries — half the bytes of the Float64 a ClickHouse float
+        // expression produces. The narrowing is the caller's to write:
         // ClickHouse casts UDF arguments with an *accurate* cast, which
-        // refuses any Float64 that float32 cannot hold exactly. Declaring
-        // `Array(Float32)` would halve the bytes on the pipe and fail every
-        // query whose features are ordinary decimals — 0.1 among them — with
-        // `CANNOT_CONVERT_TYPE`. Narrowing here costs bytes; narrowing there
-        // costs the query.
+        // refuses any Float64 float32 cannot hold exactly, so a query over
+        // Float64 columns says `[amount, hour]::Array(Float32)` once.
         (
             "modelEvaluate",
             "Float32",
-            &[("String", "model"), ("Array(Float64)", "features")],
+            &[("String", "model"), ("Array(Float32)", "features")],
             "evaluate",
         ),
     ];

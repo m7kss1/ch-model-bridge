@@ -602,7 +602,7 @@ fn a_wrong_feature_count_is_refused_on_every_channel() {
     );
 
     let mut row = rowbinary::string(FRAUD);
-    row.extend(rowbinary::f64_array(&[1.0, 2.0, 3.0]));
+    row.extend(rowbinary::f32_array(&[1.0, 2.0, 3.0]));
     let stderr = daemon
         .run_client("evaluate", &rowbinary::block(&[row]))
         .expect_failure();
@@ -610,18 +610,18 @@ fn a_wrong_feature_count_is_refused_on_every_channel() {
 }
 
 #[test]
-fn evaluate_over_the_udf_channel_narrows_float64_to_the_model() {
-    // ClickHouse float expressions produce Float64; the client narrows them,
-    // and the result must equal what the JSON path produces from float32.
+fn evaluate_over_the_udf_channel_matches_the_json_channel() {
+    // The UDF pipe carries features at the model's own width, so the scores
+    // must be the ones the JSON channel produces from the same float32 rows.
     require_model!(FRAUD);
     let daemon = fixture(&[(FRAUD, "tabular")], &[], &[]);
-    let features = [[9500.0f64, 3.0, 1.0, 0.9], [250.0, 11.0, 0.0, 0.2]];
+    let features = [[9500.0f32, 3.0, 1.0, 0.9], [250.0, 11.0, 0.0, 0.2]];
 
     let rows: Vec<Vec<u8>> = features
         .iter()
         .map(|row| {
             let mut encoded = rowbinary::string(FRAUD);
-            encoded.extend(rowbinary::f64_array(row));
+            encoded.extend(rowbinary::f32_array(row));
             encoded
         })
         .collect();

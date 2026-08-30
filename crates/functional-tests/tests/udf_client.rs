@@ -168,7 +168,7 @@ fn the_wrong_model_kind_fails_the_query() {
     assert!(stderr.contains("not a rerank model"), "{stderr}");
 
     let mut row = rowbinary::string("stub");
-    row.extend(rowbinary::f64_array(&[1.0, 2.0]));
+    row.extend(rowbinary::f32_array(&[1.0, 2.0]));
     let stderr = daemon
         .run_client("evaluate", &rowbinary::block(&[row]))
         .expect_failure();

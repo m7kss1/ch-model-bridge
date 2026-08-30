@@ -25,12 +25,11 @@ enum Mode {
     Embed,
     /// Rows of (model, query, document) -> one `Float32` per row.
     Rerank,
-    /// Rows of (model, features `Array(Float64)`) -> one `Float32` per row.
-    /// Features arrive as `Float64` because that is what ClickHouse float
-    /// expressions produce; they are narrowed to the model's float32 here.
-    /// The UDF cannot declare `Array(Float32)` and let the database narrow:
-    /// its argument cast is an accurate one, and it refuses every value
-    /// float32 cannot hold exactly — 0.1 included.
+    /// Rows of (model, features `Array(Float32)`) -> one `Float32` per row.
+    /// Features arrive at the width the model runs on, so nothing is
+    /// converted here. ClickHouse will not narrow a `Float64` expression on
+    /// its own — its argument cast is an accurate one and refuses every value
+    /// float32 cannot hold exactly, 0.1 included — so the caller casts.
     Evaluate,
 }
 
@@ -238,7 +237,7 @@ fn evaluate_block(
     for _ in 0..rows {
         models.push(read_string(input)?);
         starts.push(values.len());
-        read_narrowed_array(input, &mut values)?;
+        read_f32_array(input, &mut values)?;
     }
     starts.push(values.len());
 
@@ -345,15 +344,14 @@ fn write_varuint(output: &mut impl Write, mut value: u64) -> anyhow::Result<()> 
     }
 }
 
-/// A `RowBinary` `Array(Float64)` is a LEB128 element count followed by the
-/// elements as `f64` little-endian; they are narrowed to the model's float32
-/// as they are appended to `out`.
-fn read_narrowed_array(input: &mut impl Read, out: &mut Vec<f32>) -> anyhow::Result<()> {
+/// A `RowBinary` `Array(Float32)` is a LEB128 element count followed by the
+/// elements as `f32` little-endian; they are appended to `out`.
+fn read_f32_array(input: &mut impl Read, out: &mut Vec<f32>) -> anyhow::Result<()> {
     let len = read_varuint(input)?;
     for _ in 0..len {
-        let mut bytes = [0u8; 8];
+        let mut bytes = [0u8; 4];
         input.read_exact(&mut bytes)?;
-        out.push(f64::from_le_bytes(bytes) as f32);
+        out.push(f32::from_le_bytes(bytes));
     }
     Ok(())
 }

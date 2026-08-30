@@ -550,8 +550,8 @@ pub mod rowbinary {
         out
     }
 
-    /// `Array(Float64)`: varuint element count, then little-endian doubles.
-    pub fn f64_array(values: &[f64]) -> Vec<u8> {
+    /// `Array(Float32)`: varuint element count, then little-endian floats.
+    pub fn f32_array(values: &[f32]) -> Vec<u8> {
         let mut out = varuint(values.len() as u64);
         for value in values {
             out.extend_from_slice(&value.to_le_bytes());
