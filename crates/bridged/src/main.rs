@@ -65,8 +65,12 @@ async fn main() -> anyhow::Result<()> {
     registry.register_embedder(
         "stub",
         "stub",
-        0,
-        64,
+        registry::Serving {
+            revision: 0,
+            max_batch: 64,
+            sessions: 1,
+        },
+        None,
         Arc::new(engine::StubEngine::new(args.stub_dim)),
     );
 
@@ -84,9 +88,20 @@ async fn main() -> anyhow::Result<()> {
             model = name,
             "loading without a passport: files are not checksum-verified"
         );
-        let embedder = onnx::OnnxEmbedder::load(std::path::Path::new(dir))
+        let embedder = onnx::OnnxEmbedder::load(std::path::Path::new(dir), 1, None)
             .with_context(|| format!("loading model `{name}` from {dir}"))?;
-        registry.register_embedder(name, "onnx", 0, 64, Arc::new(embedder));
+        let max_tokens = embedder.max_tokens();
+        registry.register_embedder(
+            name,
+            "onnx",
+            registry::Serving {
+                revision: 0,
+                max_batch: 64,
+                sessions: 1,
+            },
+            Some(max_tokens),
+            Arc::new(embedder),
+        );
     }
 
     let state = http::AppState {

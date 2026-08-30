@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,6 +103,7 @@ impl ModelHandle {
 pub fn spawn_embed_worker(
     engine: Arc<dyn Embedder>,
     max_batch: usize,
+    sessions: usize,
     cache_entries: usize,
     metrics: Arc<Metrics>,
 ) -> ModelHandle {
@@ -111,6 +112,7 @@ pub fn spawn_embed_worker(
         rx,
         engine,
         max_batch.max(1),
+        sessions.max(1),
         cache_entries,
         metrics,
     ));
@@ -120,30 +122,45 @@ pub fn spawn_embed_worker(
 pub fn spawn_rerank_worker(
     engine: Arc<dyn Reranker>,
     max_batch: usize,
+    sessions: usize,
     metrics: Arc<Metrics>,
 ) -> ModelHandle {
     let (tx, rx) = mpsc::channel(max_batch.max(1) * 4);
-    tokio::spawn(rerank_worker(rx, engine, max_batch.max(1), metrics));
+    tokio::spawn(rerank_worker(
+        rx,
+        engine,
+        max_batch.max(1),
+        sessions.max(1),
+        metrics,
+    ));
     ModelHandle { tx }
 }
 
 pub fn spawn_evaluate_worker(
     engine: Arc<dyn Evaluator>,
     max_batch: usize,
+    sessions: usize,
     metrics: Arc<Metrics>,
 ) -> ModelHandle {
     let (tx, rx) = mpsc::channel(max_batch.max(1) * 4);
-    tokio::spawn(evaluate_worker(rx, engine, max_batch.max(1), metrics));
+    tokio::spawn(evaluate_worker(
+        rx,
+        engine,
+        max_batch.max(1),
+        sessions.max(1),
+        metrics,
+    ));
     ModelHandle { tx }
 }
 
 /// Pulls the first job, then keeps collecting until the batch window closes or
-/// `max_batch` items are queued.
-async fn collect_batch(rx: &mut mpsc::Receiver<Job>, first: Job, max_batch: usize) -> Vec<Job> {
+/// `limit` items are queued. The limit is `max_batch * sessions`: one
+/// collection round should be able to feed every session of the pool.
+async fn collect_batch(rx: &mut mpsc::Receiver<Job>, first: Job, limit: usize) -> Vec<Job> {
     let mut jobs = vec![first];
     let mut queued = jobs[0].size();
     let deadline = tokio::time::Instant::now() + BATCH_WINDOW;
-    while queued < max_batch {
+    while queued < limit {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(job)) => {
                 queued += job.size();
@@ -155,10 +172,47 @@ async fn collect_batch(rx: &mut mpsc::Receiver<Job>, first: Job, max_batch: usiz
     jobs
 }
 
+/// Runs the chunks of one collected batch on the blocking pool, keeping up to
+/// `sessions` of them in flight — the dispatcher half of the model's session
+/// pool. Results come back in chunk order; the first failure stops new chunks
+/// from starting and drains the ones already running.
+async fn run_chunks<C, R, F>(chunks: Vec<C>, sessions: usize, run: F) -> anyhow::Result<Vec<R>>
+where
+    C: Send + 'static,
+    R: Send + 'static,
+    F: Fn(C) -> anyhow::Result<R> + Clone + Send + 'static,
+{
+    let mut results = Vec::with_capacity(chunks.len());
+    let mut chunks = chunks.into_iter();
+    let mut in_flight = VecDeque::with_capacity(sessions);
+    let mut failure: Option<anyhow::Error> = None;
+    loop {
+        while failure.is_none() && in_flight.len() < sessions {
+            let Some(chunk) = chunks.next() else { break };
+            let run = run.clone();
+            in_flight.push_back(tokio::task::spawn_blocking(move || run(chunk)));
+        }
+        let Some(next) = in_flight.pop_front() else {
+            break;
+        };
+        match next.await {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(e)) if failure.is_none() => failure = Some(e),
+            Err(e) if failure.is_none() => failure = Some(anyhow!("inference task: {e}")),
+            _ => {}
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(results),
+    }
+}
+
 async fn embed_worker(
     mut rx: mpsc::Receiver<Job>,
     engine: Arc<dyn Embedder>,
     max_batch: usize,
+    sessions: usize,
     cache_entries: usize,
     metrics: Arc<Metrics>,
 ) {
@@ -168,7 +222,8 @@ async fn embed_worker(
         LruCache::new(NonZeroUsize::new(cache_entries.max(1)).unwrap());
 
     while let Some(first) = rx.recv().await {
-        let jobs = collect_batch(&mut rx, first, max_batch).await;
+        // Collect enough to feed every session of the pool, not just one run.
+        let jobs = collect_batch(&mut rx, first, max_batch * sessions).await;
         Metrics::add(&metrics.embed_requests, jobs.len() as u64);
 
         // Deduplicate texts across jobs and resolve cache hits up front; the
@@ -197,38 +252,34 @@ async fn embed_worker(
         }
 
         let mut computed: Vec<Arc<(Vec<f32>, usize)>> = Vec::with_capacity(unique.len());
-        let mut failure: Option<String> = None;
-        for chunk in unique.chunks(max_batch) {
+        let chunks: Vec<Vec<String>> = unique.chunks(max_batch).map(<[String]>::to_vec).collect();
+        let run = {
             let engine = Arc::clone(&engine);
-            let chunk_owned = chunk.to_vec();
-            let result = tokio::task::spawn_blocking(move || engine.embed(&chunk_owned)).await;
-            match result {
-                Ok(Ok(output)) => {
-                    Metrics::add(&metrics.embed_batches, 1);
-                    Metrics::add(&metrics.texts_embedded, chunk.len() as u64);
+            let metrics = Arc::clone(&metrics);
+            move |chunk: Vec<String>| {
+                let output = engine.embed(&chunk)?;
+                Metrics::add(&metrics.embed_batches, 1);
+                Metrics::add(&metrics.texts_embedded, chunk.len() as u64);
+                Ok(output)
+            }
+        };
+        match run_chunks(chunks, sessions, run).await {
+            Ok(outputs) => {
+                for output in outputs {
                     for (vector, tokens) in output.vectors.into_iter().zip(output.tokens) {
                         computed.push(Arc::new((vector, tokens)));
                     }
                 }
-                Ok(Err(e)) => {
-                    failure = Some(e.to_string());
-                    break;
-                }
-                Err(e) => {
-                    failure = Some(format!("inference task: {e}"));
-                    break;
-                }
             }
-        }
-
-        if let Some(message) = failure {
-            Metrics::add(&metrics.errors, 1);
-            for job in jobs {
-                if let Job::Embed { reply, .. } = job {
-                    let _ = reply.send(Err(anyhow!("{message}")));
+            Err(e) => {
+                Metrics::add(&metrics.errors, 1);
+                for job in jobs {
+                    if let Job::Embed { reply, .. } = job {
+                        let _ = reply.send(Err(anyhow!("{e}")));
+                    }
                 }
+                continue;
             }
-            continue;
         }
 
         for (text, index) in &position {
@@ -271,12 +322,13 @@ async fn rerank_worker(
     mut rx: mpsc::Receiver<Job>,
     engine: Arc<dyn Reranker>,
     max_batch: usize,
+    sessions: usize,
     metrics: Arc<Metrics>,
 ) {
     // No cache here: (query, document) pairs almost never repeat, unlike
     // single texts.
     while let Some(first) = rx.recv().await {
-        let jobs = collect_batch(&mut rx, first, max_batch).await;
+        let jobs = collect_batch(&mut rx, first, max_batch * sessions).await;
         Metrics::add(&metrics.rerank_requests, jobs.len() as u64);
 
         let mut all_pairs: Vec<(String, String)> = Vec::new();
@@ -291,38 +343,36 @@ async fn rerank_worker(
 
         let mut scores: Vec<f32> = Vec::with_capacity(all_pairs.len());
         let mut tokens: Vec<usize> = Vec::with_capacity(all_pairs.len());
-        let mut failure: Option<String> = None;
-        for chunk in all_pairs.chunks(max_batch) {
+        let chunks: Vec<Vec<(String, String)>> = all_pairs
+            .chunks(max_batch)
+            .map(<[(String, String)]>::to_vec)
+            .collect();
+        let run = {
             let engine = Arc::clone(&engine);
-            let chunk_owned = chunk.to_vec();
-            let result =
-                tokio::task::spawn_blocking(move || engine.score_pairs(&chunk_owned)).await;
-            match result {
-                Ok(Ok(output)) => {
-                    Metrics::add(&metrics.rerank_batches, 1);
-                    Metrics::add(&metrics.pairs_scored, chunk.len() as u64);
+            let metrics = Arc::clone(&metrics);
+            move |chunk: Vec<(String, String)>| {
+                let output = engine.score_pairs(&chunk)?;
+                Metrics::add(&metrics.rerank_batches, 1);
+                Metrics::add(&metrics.pairs_scored, chunk.len() as u64);
+                Ok(output)
+            }
+        };
+        match run_chunks(chunks, sessions, run).await {
+            Ok(outputs) => {
+                for output in outputs {
                     scores.extend(output.scores);
                     tokens.extend(output.tokens);
                 }
-                Ok(Err(e)) => {
-                    failure = Some(e.to_string());
-                    break;
-                }
-                Err(e) => {
-                    failure = Some(format!("inference task: {e}"));
-                    break;
-                }
             }
-        }
-
-        if let Some(message) = failure {
-            Metrics::add(&metrics.errors, 1);
-            for job in jobs {
-                if let Job::Rerank { reply, .. } = job {
-                    let _ = reply.send(Err(anyhow!("{message}")));
+            Err(e) => {
+                Metrics::add(&metrics.errors, 1);
+                for job in jobs {
+                    if let Job::Rerank { reply, .. } = job {
+                        let _ = reply.send(Err(anyhow!("{e}")));
+                    }
                 }
+                continue;
             }
-            continue;
         }
 
         let mut offset = 0usize;
@@ -345,13 +395,14 @@ async fn evaluate_worker(
     mut rx: mpsc::Receiver<Job>,
     engine: Arc<dyn Evaluator>,
     max_batch: usize,
+    sessions: usize,
     metrics: Arc<Metrics>,
 ) {
     let n_features = engine.n_features();
     // No cache: feature rows are continuous values and effectively never
     // repeat.
     while let Some(first) = rx.recv().await {
-        let jobs = collect_batch(&mut rx, first, max_batch).await;
+        let jobs = collect_batch(&mut rx, first, max_batch * sessions).await;
         Metrics::add(&metrics.evaluate_requests, jobs.len() as u64);
 
         let mut all_values: Vec<f32> = Vec::new();
@@ -365,36 +416,31 @@ async fn evaluate_worker(
         }
 
         let mut scores: Vec<f32> = Vec::with_capacity(all_values.len() / n_features.max(1));
-        let mut failure: Option<String> = None;
-        for chunk in all_values.chunks(max_batch * n_features) {
+        let chunks: Vec<Vec<f32>> = all_values
+            .chunks(max_batch * n_features)
+            .map(<[f32]>::to_vec)
+            .collect();
+        let run = {
             let engine = Arc::clone(&engine);
-            let chunk_owned = chunk.to_vec();
-            let result = tokio::task::spawn_blocking(move || engine.evaluate(&chunk_owned)).await;
-            match result {
-                Ok(Ok(output)) => {
-                    Metrics::add(&metrics.evaluate_batches, 1);
-                    Metrics::add(&metrics.rows_evaluated, output.len() as u64);
-                    scores.extend(output);
-                }
-                Ok(Err(e)) => {
-                    failure = Some(e.to_string());
-                    break;
-                }
-                Err(e) => {
-                    failure = Some(format!("inference task: {e}"));
-                    break;
-                }
+            let metrics = Arc::clone(&metrics);
+            move |chunk: Vec<f32>| {
+                let output = engine.evaluate(&chunk)?;
+                Metrics::add(&metrics.evaluate_batches, 1);
+                Metrics::add(&metrics.rows_evaluated, output.len() as u64);
+                Ok(output)
             }
-        }
-
-        if let Some(message) = failure {
-            Metrics::add(&metrics.errors, 1);
-            for job in jobs {
-                if let Job::Evaluate { reply, .. } = job {
-                    let _ = reply.send(Err(anyhow!("{message}")));
+        };
+        match run_chunks(chunks, sessions, run).await {
+            Ok(outputs) => scores.extend(outputs.into_iter().flatten()),
+            Err(e) => {
+                Metrics::add(&metrics.errors, 1);
+                for job in jobs {
+                    if let Job::Evaluate { reply, .. } = job {
+                        let _ = reply.send(Err(anyhow!("{e}")));
+                    }
                 }
+                continue;
             }
-            continue;
         }
 
         let mut offset = 0usize;
