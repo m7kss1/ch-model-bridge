@@ -235,7 +235,9 @@ fn model_evaluate_scores_a_table() {
         "CREATE TABLE tx (id UInt32, amount Float64, hour Float64, is_new_device Float64, merchant_risk Float64) \
            ENGINE = Memory; \
          INSERT INTO tx VALUES (1, 4800, 2, 0, 0.1), (2, 4800, 14, 0, 0.1), (3, 9500, 3, 1, 0.9); \
-         SELECT id, modelEvaluate('{FRAUD}', [amount, hour, is_new_device, merchant_risk]) AS score \
+         SELECT id, \
+                modelEvaluate('{FRAUD}', [amount, hour, is_new_device, merchant_risk]::Array(Float32)) \
+                  AS score \
          FROM tx ORDER BY score DESC"
     ));
 
@@ -247,6 +249,32 @@ fn model_evaluate_scores_a_table() {
         order,
         vec!["3", "1", "2"],
         "night and device risk must outrank the same amount in daylight:\n{scores}"
+    );
+}
+
+#[test]
+fn features_reach_the_daemon_only_once_they_are_float32() {
+    // The UDF takes features at the model's own width, and ClickHouse will
+    // not narrow a Float64 expression into it: its argument cast is an
+    // accurate one, so the narrowing is the caller's to write.
+    require_clickhouse!();
+    require_model!(E5);
+    let cluster = Cluster::start(&[(E5, "embedding")]);
+
+    let uncast = cluster.query_fails(&format!("SELECT modelEvaluate('{E5}', [0.1, 1.0])"));
+    assert!(
+        uncast.contains("CANNOT_CONVERT_TYPE"),
+        "an uncast Float64 feature must stop at the cast:\n{uncast}"
+    );
+
+    // Cast, the same call reaches the daemon, which turns it down for being
+    // an embedding model — proof that it arrived.
+    let cast = cluster.query_fails(&format!(
+        "SELECT modelEvaluate('{E5}', [0.1, 1.0]::Array(Float32))"
+    ));
+    assert!(
+        cast.contains("is not a tabular model"),
+        "the cast form must reach the daemon:\n{cast}"
     );
 }
 
@@ -264,8 +292,8 @@ fn a_mutation_can_backfill_a_column() {
          INSERT INTO tx (id, amount, hour, is_new_device, merchant_risk) \
            SELECT number, 100 + number, number % 24, 0, 0.5 FROM numbers(50); \
          SET mutations_sync = 2; \
-         ALTER TABLE tx UPDATE fraud_score = \
-           modelEvaluate('{FRAUD}', [amount, hour, is_new_device, merchant_risk]) WHERE 1; \
+         ALTER TABLE tx UPDATE fraud_score = modelEvaluate( \
+           '{FRAUD}', [amount, hour, is_new_device, merchant_risk]::Array(Float32)) WHERE 1; \
          SELECT count() FROM tx WHERE fraud_score != 0"
     ));
 

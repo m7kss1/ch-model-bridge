@@ -9,7 +9,9 @@ the fraud probability; an sklearn classifier would export two outputs (label
 and probabilities) and be rejected at load time.
 
 Feature order is part of the model contract: amount, hour_of_day,
-is_new_device, merchant_risk. SQL callers must pass features in this order.
+is_new_device, merchant_risk. SQL callers must pass features in this order,
+cast to Array(Float32): modelEvaluate('fraud-demo', [amount, hour_of_day,
+is_new_device, merchant_risk]::Array(Float32)).
 """
 
 import json

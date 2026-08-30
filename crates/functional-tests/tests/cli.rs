@@ -206,9 +206,9 @@ fn gen_configs_declares_the_three_sql_functions() {
         "without this, mutations on Replicated tables reject these functions"
     );
 
-    // modelEvaluate takes Float64 because that is what ClickHouse float
-    // expressions produce; the client narrows.
-    assert!(xml.contains("<argument><type>Array(Float64)</type><name>features</name></argument>"));
+    // modelEvaluate takes features at the width the models run on; a query
+    // over Float64 columns casts them itself.
+    assert!(xml.contains("<argument><type>Array(Float32)</type><name>features</name></argument>"));
     assert!(xml.contains("<argument><type>String</type><name>document</name></argument>"));
 }
 

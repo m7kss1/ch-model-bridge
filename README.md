@@ -21,6 +21,8 @@ The bottom path from the picture is the main one:
 
 `localEmbed`, `localRerank` and `modelEvaluate` are executable UDFs: ClickHouse streams whole ~65k row batches into a pool of thin `bridge-client` processes, which forward them over a socket to the daemon
 
+Features reach `modelEvaluate` as `Array(Float32)`, the width the models run on, so nothing is widened for the trip. ClickHouse will not narrow a `Float64` expression into it on its own — the cast it applies to UDF arguments is an accurate one and refuses any value float32 cannot hold exactly — so a query over `Float64` columns narrows once, itself: `modelEvaluate('fraud', [amount, hour]::Array(Float32))`
+
 Every model is defined by a manifest: the SHA-256 of each file the runtime
 loads, plus a pinned revision. Where the files came from is irrelevant — the
 manifest is the identity. The daemon verifies it before serving and refuses

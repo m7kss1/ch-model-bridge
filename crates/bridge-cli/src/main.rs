@@ -392,10 +392,16 @@ fn gen_configs(client: &Path, socket: &Path, out: &Path, tuning: &UdfTuning) -> 
             ],
             "rerank",
         ),
+        // Float32 is the width the models run on, so that is what the pipe
+        // carries — half the bytes of the Float64 a ClickHouse float
+        // expression produces. The narrowing is the caller's to write:
+        // ClickHouse casts UDF arguments with an *accurate* cast, which
+        // refuses any Float64 float32 cannot hold exactly, so a query over
+        // Float64 columns says `[amount, hour]::Array(Float32)` once.
         (
             "modelEvaluate",
             "Float32",
-            &[("String", "model"), ("Array(Float64)", "features")],
+            &[("String", "model"), ("Array(Float32)", "features")],
             "evaluate",
         ),
     ];
