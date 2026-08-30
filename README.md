@@ -31,7 +31,11 @@ vectors
 
 The daemon keeps each model in memory once per host. Requests from all
 clients merge into shared batches and inference runs off the network path on
-a blocking pool
+a blocking pool. A model normally serves through one ONNX session; on a host
+with cores to spare, `sessions = k` in the manifest raises that to k parallel
+sessions which share prepacked weight buffers and split the machine's threads
+between them, so inference throughput grows k-fold without keeping k full
+copies of the model
 
 The top path exists for compatibility. ClickHouse's stock AI functions are
 OpenAI-protocol HTTP clients, and the daemon speaks that protocol, so
@@ -63,6 +67,15 @@ curl -L -o models/e5/tokenizer.json \
 model-bridge passport models/e5 --name e5 --kind embedding
 ```
 
+The manifest also carries the serving knobs, every one optional. `--max-batch`
+bounds one ONNX run and defaults by kind: 64 rows for text models, a whole
+~65k ClickHouse block for tabular ones, where the entire point is scoring the
+block in a single call. `--sessions` turns on the parallel session pool
+described above; values beyond the host's core count are capped at load,
+since extra sessions would add weight copies without adding parallelism. `--max-tokens` sets the truncation limit for long-context
+encoders — without it the daemon takes the limit from `tokenizer.json`, or
+falls back to the 512 the BERT family implies
+
 **2. Start the daemon.** On start `bridged` reads the manifests from `models.d/`, re-verifies every file against its SHA-256, loads the models into memory, and only then opens its two entrances: unix socket at the path you pass, and HTTP on `127.0.0.1:9017`. Leave it running and remember the socket path - ClickHouse will connect to exactly this file:
 
 ```bash
@@ -84,7 +97,7 @@ Nobody hands these files to ClickHouse automatically — you do it once. The com
 <user_scripts_path>/abs/path/bridge-configs/scripts</user_scripts_path>
 ```
 
-From that reload ClickHouse knows the functions. When a query calls one, ClickHouse itself spawns `bridge-client` from the scripts directory, and the adapter connects to the daemon's socket — the circle closes
+From that reload ClickHouse knows the functions. When a query calls one, ClickHouse itself spawns `bridge-client` from the scripts directory, and the adapter connects to the daemon's socket — the circle closes. The adapter opens that connection on demand and reopens it whenever it breaks, so restarting the daemon — which is how a model gets updated — makes queries in flight wait out the restart, up to ten seconds, instead of failing them, and the pool of warmed-up adapter processes survives untouched
 
 **4. Verify.**
 

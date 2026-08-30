@@ -127,6 +127,11 @@ fn the_embedding_model_reports_a_complete_card() {
     assert_eq!(card["backend"], "onnx");
     assert_eq!(card["revision"], 1);
     assert_eq!(card["max_batch"], 64);
+    assert_eq!(card["sessions"], 1, "one session unless the passport asks");
+    assert_eq!(
+        card["max_tokens"], 512,
+        "e5 ships no truncation section, so the family default applies"
+    );
     assert!(
         daemon.logs().contains("model verified and loaded"),
         "the daemon must report what it verified:\n{}",
@@ -274,6 +279,69 @@ fn the_passport_batch_size_bounds_the_model_runs() {
         3,
         "six texts at max_batch=2 are exactly three model runs"
     );
+}
+
+#[test]
+fn a_session_pool_preserves_row_order() {
+    // With `sessions = 2` and one-text batches, a single request fans out
+    // into eight ONNX runs with up to two in flight; every vector must
+    // still land on its own row. Two sessions, not more: the daemon caps
+    // the pool to the host's cores, and two exist everywhere the models
+    // tier realistically runs.
+    require_model!(E5);
+    let daemon = fixture(
+        &[(E5, "embedding")],
+        &["--sessions", "2", "--max-batch", "1"],
+        &[],
+    );
+
+    let texts: Vec<String> = ["query", "passage"]
+        .iter()
+        .flat_map(|prefix| TICKETS[..4].iter().map(move |t| format!("{prefix}: {t}")))
+        .collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let vectors = embed_http(&daemon, E5, &refs);
+
+    assert_eq!(daemon.get("/v1/models").json()["data"][0]["sessions"], 2);
+    assert_eq!(
+        daemon.metric("model_bridge_embed_batches_total"),
+        8,
+        "eight texts at max_batch=1 are eight model runs"
+    );
+    // Row i holds `query: ticket_i`, row 4+i holds `passage: ticket_i`; the
+    // same ticket under both prefixes must beat every other passage, which
+    // fails loudly if parallel chunks came back onto the wrong rows.
+    for query in 0..4 {
+        let best = (0..4)
+            .max_by(|a, b| {
+                cosine(&vectors[query], &vectors[4 + a])
+                    .total_cmp(&cosine(&vectors[query], &vectors[4 + b]))
+            })
+            .unwrap();
+        assert_eq!(
+            best, query,
+            "query row {query} pairs with passage row {best}: rows were reordered"
+        );
+    }
+}
+
+#[test]
+fn the_passport_token_limit_caps_tokenization() {
+    // `max_tokens` from the passport must bound what the model sees: usage
+    // reports tokens after truncation, so a capped input shows the cap.
+    require_model!(E5);
+    let daemon = fixture(&[(E5, "embedding")], &["--max-tokens", "16"], &[]);
+
+    let body = daemon
+        .post_json(
+            "/v1/embeddings",
+            json!({"model": E5, "input": "transfer ".repeat(400)}),
+        )
+        .expect_status(200)
+        .json();
+
+    assert_eq!(body["usage"]["prompt_tokens"], 16);
+    assert_eq!(daemon.get("/v1/models").json()["data"][0]["max_tokens"], 16);
 }
 
 #[test]
@@ -572,6 +640,61 @@ fn the_tabular_model_learned_the_amount_by_hour_interaction() {
     assert!(
         scores[2] > scores[0],
         "the worst row must score highest: {scores:?}"
+    );
+}
+
+#[test]
+fn a_tabular_model_scores_thousands_of_rows_in_one_run() {
+    // The point of the kind-dependent default: a ClickHouse-sized block must
+    // reach a tree ensemble as one ONNX call, not as hundreds of 64-row runs.
+    require_model!(FRAUD);
+    let daemon = fixture(&[(FRAUD, "tabular")], &[], &[]);
+
+    let card = daemon.get("/v1/models").expect_status(200).json()["data"][0].clone();
+    assert_eq!(card["name"], FRAUD);
+    assert_eq!(card["max_batch"], 65536, "a whole block per run by default");
+    assert!(
+        card.get("max_tokens").is_none(),
+        "a tabular card must not carry a token limit: {card}"
+    );
+
+    let rows: Vec<[f64; 4]> = (0..10_000)
+        .map(|i| [(i % 9000) as f64, (i % 24) as f64, (i % 2) as f64, 0.5])
+        .collect();
+    let body = daemon
+        .post_json("/v1/evaluate", json!({"model": FRAUD, "rows": rows}))
+        .expect_status(200)
+        .json();
+
+    assert_eq!(body["scores"].as_array().unwrap().len(), 10_000);
+    assert_eq!(
+        daemon.metric("model_bridge_evaluate_batches_total"),
+        1,
+        "ten thousand rows must fit one model run"
+    );
+}
+
+#[test]
+fn an_oversized_session_pool_is_capped_to_the_cores() {
+    // `sessions = 9999` must not honestly build 9999 sessions and die at
+    // startup: beyond the core count extra sessions add weight copies, not
+    // parallelism, so the daemon caps the value and says so. The tabular
+    // model keeps this cheap — its sessions are megabytes, not hundreds.
+    require_model!(FRAUD);
+    let daemon = fixture(&[(FRAUD, "tabular")], &["--sessions", "9999"], &[]);
+
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    assert_eq!(
+        daemon.get("/v1/models").json()["data"][0]["sessions"],
+        cores as u64,
+        "the pool must be capped to the host's core count"
+    );
+    assert!(
+        daemon
+            .logs()
+            .contains("sessions capped to the host's core count"),
+        "capping must be loud:\n{}",
+        daemon.logs()
     );
 }
 

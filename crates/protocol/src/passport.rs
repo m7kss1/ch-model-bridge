@@ -27,13 +27,21 @@ pub struct Passport {
     /// location, so a passport tree can be moved as a whole.
     pub dir: PathBuf,
     pub revision: u32,
-    #[serde(default = "default_max_batch")]
-    pub max_batch: usize,
+    /// Rows per ONNX run. When absent the daemon resolves a default by kind,
+    /// see [`Passport::effective_max_batch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch: Option<usize>,
+    /// Parallel ONNX sessions the daemon keeps for this model; absent means
+    /// one. Each extra session buys one more concurrent inference stream at
+    /// the price of another copy of the non-prepacked weights. The daemon
+    /// caps the value to the host's core count at load time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<usize>,
+    /// Text models only: truncation limit in tokens. Absent means the limit
+    /// shipped in `tokenizer.json`, or 512 when it ships none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
     pub sha256: BTreeMap<String, String>,
-}
-
-fn default_max_batch() -> usize {
-    64
 }
 
 impl Passport {
@@ -51,6 +59,23 @@ impl Passport {
         let text = toml::to_string_pretty(self).context("serialize passport")?;
         std::fs::write(path, text).with_context(|| path.display().to_string())?;
         Ok(())
+    }
+
+    /// The batch size to serve with. An unpinned text model gets 64: batches
+    /// are padded to their longest member, so bigger ones mostly multiply
+    /// wasted positions. An unpinned tabular model gets a whole ClickHouse
+    /// block: a tree ensemble scores 65k rows in one call, and slicing that
+    /// into 64-row runs turns one block into a thousand ONNX invocations.
+    pub fn effective_max_batch(&self) -> usize {
+        self.max_batch.unwrap_or(match self.kind {
+            ModelKind::Tabular => 65536,
+            ModelKind::Embedding | ModelKind::Rerank => 64,
+        })
+    }
+
+    /// The session pool size to serve with, never less than one.
+    pub fn effective_sessions(&self) -> usize {
+        self.sessions.unwrap_or(1).max(1)
     }
 
     pub fn resolved_dir(&self, passport_path: &Path) -> PathBuf {

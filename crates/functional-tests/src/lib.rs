@@ -118,6 +118,7 @@ pub fn corrupt_file(path: &Path) {
 
 // -------------------------------------------------------------------- daemon
 
+#[derive(Clone)]
 pub struct DaemonBuilder {
     args: Vec<String>,
     env: Vec<(String, String)>,
@@ -210,14 +211,16 @@ impl DaemonBuilder {
             .spawn()
             .expect("spawn bridged");
 
+        let with_socket = self.with_socket;
         let mut daemon = Daemon {
             child,
             port,
             socket,
             log,
-            _dir: dir,
+            dir,
+            builder: self,
         };
-        daemon.wait_ready(self.with_socket);
+        daemon.wait_ready(with_socket);
         daemon
     }
 
@@ -266,7 +269,8 @@ pub struct Daemon {
     pub port: u16,
     pub socket: PathBuf,
     log: PathBuf,
-    _dir: TempDir,
+    dir: TempDir,
+    builder: DaemonBuilder,
 }
 
 impl Daemon {
@@ -340,6 +344,27 @@ impl Daemon {
     pub fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Kills the daemon and brings a fresh one up on the same socket path,
+    /// the way an operator restarts it to pick up changed models. The HTTP
+    /// port is allocated anew unless the builder pinned one; the socket path
+    /// is the part of the contract that survives a restart.
+    pub fn restart(&mut self) {
+        self.stop();
+        self.port = self.builder.listen_port.unwrap_or_else(free_port);
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.log)
+            .expect("reopen log file");
+        let mut command = self.builder.command(&self.dir, self.port, &self.socket);
+        self.child = command
+            .stdout(Stdio::from(file.try_clone().expect("clone log handle")))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .expect("respawn bridged");
+        self.wait_ready(self.builder.with_socket);
     }
 
     fn wait_ready(&mut self, with_socket: bool) {

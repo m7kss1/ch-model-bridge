@@ -49,7 +49,16 @@ fn a_passport_records_every_file_the_runtime_will_load() {
         &dir,
         &model,
         "demo",
-        &["--revision", "7", "--max-batch", "12"],
+        &[
+            "--revision",
+            "7",
+            "--max-batch",
+            "12",
+            "--sessions",
+            "3",
+            "--max-tokens",
+            "1024",
+        ],
     );
 
     let path = std::path::Path::new(&passports).join("demo.toml");
@@ -58,7 +67,9 @@ fn a_passport_records_every_file_the_runtime_will_load() {
     assert_eq!(passport.name, "demo");
     assert_eq!(passport.kind, ModelKind::Embedding);
     assert_eq!(passport.revision, 7);
-    assert_eq!(passport.max_batch, 12);
+    assert_eq!(passport.max_batch, Some(12));
+    assert_eq!(passport.sessions, Some(3));
+    assert_eq!(passport.max_tokens, Some(1024));
     assert_eq!(passport.dir, model);
     assert_eq!(
         passport.sha256.keys().collect::<Vec<_>>(),

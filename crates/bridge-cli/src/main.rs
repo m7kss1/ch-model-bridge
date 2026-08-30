@@ -39,8 +39,8 @@ enum Command {
         kind: KindArg,
         #[arg(long, default_value_t = 1)]
         revision: u32,
-        #[arg(long, default_value_t = 64)]
-        max_batch: usize,
+        #[command(flatten)]
+        tuning: ServingTuning,
         #[arg(long, default_value = "models.d")]
         passports: PathBuf,
     },
@@ -59,6 +59,36 @@ enum Command {
         #[command(flatten)]
         tuning: UdfTuning,
     },
+}
+
+/// Serving knobs recorded in the passport. Every one is optional: an absent
+/// value is not written, and the daemon resolves the default at load time —
+/// `max_batch` by model kind, `sessions` to one, `max_tokens` from
+/// `tokenizer.json` or the 512 family default.
+#[derive(Args)]
+struct ServingTuning {
+    /// Rows per ONNX run. Defaults by kind: 64 for embedding and rerank,
+    /// 65536 (a whole ClickHouse block) for tabular.
+    #[arg(long)]
+    max_batch: Option<usize>,
+    /// Parallel ONNX sessions the daemon keeps for this model. The daemon
+    /// caps the value to the host's core count at load time.
+    #[arg(long)]
+    sessions: Option<usize>,
+    /// Truncation limit in tokens for text models with a context longer than
+    /// the 512-token default, such as 8k-context encoders.
+    #[arg(long)]
+    max_tokens: Option<usize>,
+}
+
+impl ServingTuning {
+    fn unspecified() -> Self {
+        Self {
+            max_batch: None,
+            sessions: None,
+            max_tokens: None,
+        }
+    }
 }
 
 /// Tuning written into every generated function, named after the ClickHouse
@@ -159,9 +189,9 @@ fn main() -> anyhow::Result<()> {
             name,
             kind,
             revision,
-            max_batch,
+            tuning,
             passports,
-        } => issue_passport(&dir, &name, kind.into(), revision, max_batch, &passports),
+        } => issue_passport(&dir, &name, kind.into(), revision, &tuning, &passports),
         Command::GenConfigs {
             client,
             socket,
@@ -224,7 +254,15 @@ fn fetch(name: &str, models_root: &Path, passports: &Path) -> anyhow::Result<()>
         sums.insert(file.name.to_string(), sum);
     }
 
-    write_passport(entry.name, entry.kind, &dir, 1, 64, sums, passports)
+    write_passport(
+        entry.name,
+        entry.kind,
+        &dir,
+        1,
+        &ServingTuning::unspecified(),
+        sums,
+        passports,
+    )
 }
 
 fn download(url: &str, target: &Path) -> anyhow::Result<()> {
@@ -246,7 +284,7 @@ fn issue_passport(
     name: &str,
     kind: ModelKind,
     revision: u32,
-    max_batch: usize,
+    tuning: &ServingTuning,
     passports: &Path,
 ) -> anyhow::Result<()> {
     // Text models are inseparable from their tokenizer, so the passport
@@ -267,7 +305,7 @@ fn issue_passport(
         }
         sums.insert(file.to_string(), sha256_file(&path)?);
     }
-    write_passport(name, kind, dir, revision, max_batch, sums, passports)
+    write_passport(name, kind, dir, revision, tuning, sums, passports)
 }
 
 fn write_passport(
@@ -275,7 +313,7 @@ fn write_passport(
     kind: ModelKind,
     dir: &Path,
     revision: u32,
-    max_batch: usize,
+    tuning: &ServingTuning,
     sha256: BTreeMap<String, String>,
     passports: &Path,
 ) -> anyhow::Result<()> {
@@ -287,7 +325,9 @@ fn write_passport(
             .canonicalize()
             .with_context(|| dir.display().to_string())?,
         revision,
-        max_batch,
+        max_batch: tuning.max_batch,
+        sessions: tuning.sessions,
+        max_tokens: tuning.max_tokens,
         sha256,
     };
     let path = passports.join(format!("{name}.toml"));

@@ -10,12 +10,19 @@
 //! Every row the database scans crosses this process, so nothing here copies
 //! a row it does not have to: rows are read once, handed to the encoder by
 //! reference, and the frames are buffers the process reuses for its lifetime.
+//!
+//! The daemon connection is opened on first use and replaced whenever it
+//! breaks. A daemon restart is the normal way to update models, and it must
+//! not cost ClickHouse its pool of warmed-up UDF processes: a request caught
+//! mid-flight is sent again over a fresh connection, which is safe because
+//! inference has no side effects to repeat.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use protocol::wire::{self, Response};
@@ -44,7 +51,9 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let (mode, socket) = parse_args()?;
-    let mut channel = Channel::connect(&socket)?;
+    // Not connected here: a daemon that is down while ClickHouse spawns the
+    // pool must stall the first request, not kill the process on arrival.
+    let mut daemon = Daemon::new(socket);
 
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
@@ -53,53 +62,120 @@ fn run() -> anyhow::Result<()> {
 
     while let Some(rows) = read_chunk_header(&mut input)? {
         match mode {
-            Mode::Embed => embed_block(&mut channel, &mut input, &mut output, rows)?,
-            Mode::Rerank => rerank_block(&mut channel, &mut input, &mut output, rows)?,
-            Mode::Evaluate => evaluate_block(&mut channel, &mut input, &mut output, rows)?,
+            Mode::Embed => embed_block(&mut daemon, &mut input, &mut output, rows)?,
+            Mode::Rerank => rerank_block(&mut daemon, &mut input, &mut output, rows)?,
+            Mode::Evaluate => evaluate_block(&mut daemon, &mut input, &mut output, rows)?,
         }
         output.flush()?;
     }
     Ok(())
 }
 
-/// The daemon connection and the two frame buffers. ClickHouse keeps a pooled
-/// client alive across many blocks, so both grow once to the size of the
-/// largest block and never allocate again.
-struct Channel {
-    daemon: UnixStream,
+/// How long a request keeps being retried once the daemon stops answering,
+/// counted from the first failure. Long enough to ride out a restart that
+/// serves prepared models, short enough that ClickHouse's own UDF timeouts,
+/// ten seconds by default, stay the ones an operator reasons about.
+const RETRY_WINDOW: Duration = Duration::from_secs(10);
+
+/// The daemon connection, opened lazily and replaced after any transport
+/// failure, together with the two frame buffers every request reuses.
+/// ClickHouse keeps a pooled client alive across many blocks, so the buffers
+/// grow once to the size of the largest block and never allocate again.
+struct Daemon {
+    socket: PathBuf,
+    stream: Option<UnixStream>,
     request: Vec<u8>,
     reply: Vec<u8>,
 }
 
-impl Channel {
-    fn connect(socket: &Path) -> anyhow::Result<Self> {
-        let daemon = UnixStream::connect(socket)
-            .with_context(|| format!("connecting to the daemon at {}", socket.display()))?;
-        Ok(Self {
-            daemon,
+impl Daemon {
+    fn new(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            stream: None,
             request: Vec::new(),
             reply: Vec::new(),
-        })
+        }
     }
 
     /// Sends whatever the caller encoded into `request` and decodes the answer.
+    /// When the transport fails — the daemon restarting is the expected
+    /// reason — the request is resent on a fresh connection until
+    /// `RETRY_WINDOW` past the first failure, so a restart briefly stalls
+    /// queries instead of failing them and never leaves the pooled process
+    /// wedged.
     fn round_trip(&mut self) -> anyhow::Result<Response> {
-        self.daemon
-            .write_all(&(self.request.len() as u32).to_le_bytes())?;
-        self.daemon.write_all(&self.request)?;
+        let mut give_up: Option<Instant> = None;
+        let mut delay = Duration::from_millis(50);
+        loop {
+            let error = match self.attempt() {
+                Ok(()) => {
+                    return wire::decode_response(&self.reply)
+                        .map_err(|e| anyhow!("bad response frame: {e}"));
+                }
+                Err(e) if !worth_retrying(&e) => {
+                    return Err(e).with_context(|| {
+                        format!("talking to the daemon at {}", self.socket.display())
+                    });
+                }
+                Err(e) => e,
+            };
+            // Never reuse a stream that failed mid-frame: a late reply on it
+            // could be mistaken for the answer to the resent request.
+            self.stream = None;
+            let give_up_at = *give_up.get_or_insert_with(|| Instant::now() + RETRY_WINDOW);
+            let now = Instant::now();
+            if now >= give_up_at {
+                return Err(error).with_context(|| {
+                    format!(
+                        "daemon at {} still unreachable after retrying for {RETRY_WINDOW:?}",
+                        self.socket.display()
+                    )
+                });
+            }
+            std::thread::sleep(delay.min(give_up_at - now));
+            delay = (delay * 2).min(Duration::from_secs(1));
+        }
+    }
+
+    /// One frame out of `request`, one frame into `reply`.
+    fn attempt(&mut self) -> io::Result<()> {
+        if self.stream.is_none() {
+            self.stream = Some(UnixStream::connect(&self.socket)?);
+        }
+        let stream = self.stream.as_mut().expect("connected above");
+        stream.write_all(&(self.request.len() as u32).to_le_bytes())?;
+        stream.write_all(&self.request)?;
 
         let mut len_buf = [0u8; 4];
-        self.daemon
-            .read_exact(&mut len_buf)
-            .context("daemon closed the connection")?;
+        stream.read_exact(&mut len_buf)?;
         let len = u32::from_le_bytes(len_buf);
         if len > wire::MAX_FRAME {
-            bail!("daemon sent a frame of {len} bytes, over the limit");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("daemon sent a frame of {len} bytes, over the limit"),
+            ));
         }
         self.reply.resize(len as usize, 0);
-        self.daemon.read_exact(&mut self.reply)?;
-        wire::decode_response(&self.reply).map_err(|e| anyhow!("bad response frame: {e}"))
+        stream.read_exact(&mut self.reply)?;
+        Ok(())
     }
+}
+
+/// Transport failures that mean the daemon is gone or restarting: the socket
+/// file missing or stale while the daemon rebinds, the connection refused,
+/// reset or closed under a request. Anything else — a permission error, an
+/// oversized frame — is a fault that retrying would only repeat.
+fn worth_retrying(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 /// The model name is a per-row argument in SQL, but it is almost always a
@@ -128,7 +204,7 @@ fn group_by_model(models: &[String]) -> Vec<(&str, Vec<usize>)> {
 }
 
 fn embed_block(
-    channel: &mut Channel,
+    daemon: &mut Daemon,
     input: &mut impl BufRead,
     output: &mut impl Write,
     rows: usize,
@@ -147,8 +223,8 @@ fn embed_block(
     let mut placement = vec![(0usize, 0usize); rows];
     for (model, indices) in group_by_model(&models) {
         let group: Vec<&str> = indices.iter().map(|&index| texts[index].as_str()).collect();
-        wire::encode_embed(model, &group, &mut channel.request);
-        let response = channel.round_trip()?;
+        wire::encode_embed(model, &group, &mut daemon.request);
+        let response = daemon.round_trip()?;
         let Response::Embed { dim, vectors } = response else {
             bail!("daemon: {}", response_error(response));
         };
@@ -177,7 +253,7 @@ fn embed_block(
 }
 
 fn rerank_block(
-    channel: &mut Channel,
+    daemon: &mut Daemon,
     input: &mut impl BufRead,
     output: &mut impl Write,
     rows: usize,
@@ -200,8 +276,8 @@ fn rerank_block(
                 (query.as_str(), document.as_str())
             })
             .collect();
-        wire::encode_rerank(model, &group, &mut channel.request);
-        let response = channel.round_trip()?;
+        wire::encode_rerank(model, &group, &mut daemon.request);
+        let response = daemon.round_trip()?;
         let Response::Rerank { scores: answer } = response else {
             bail!("daemon: {}", response_error(response));
         };
@@ -224,7 +300,7 @@ fn rerank_block(
 }
 
 fn evaluate_block(
-    channel: &mut Channel,
+    daemon: &mut Daemon,
     input: &mut impl BufRead,
     output: &mut impl Write,
     rows: usize,
@@ -259,8 +335,8 @@ fn evaluate_block(
             }
             group.extend_from_slice(row);
         }
-        wire::encode_evaluate(model, n_features as u32, &group, &mut channel.request);
-        let response = channel.round_trip()?;
+        wire::encode_evaluate(model, n_features as u32, &group, &mut daemon.request);
+        let response = daemon.round_trip()?;
         let Response::Evaluate { scores: answer } = response else {
             bail!("daemon: {}", response_error(response));
         };

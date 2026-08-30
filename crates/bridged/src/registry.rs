@@ -22,14 +22,28 @@ pub struct ModelCard {
     /// Tabular models only: how many floats each feature row must contain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n_features: Option<usize>,
+    /// Text models only: tokens kept per input before truncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
     pub revision: u32,
     pub max_batch: usize,
+    /// Parallel ONNX sessions serving this model.
+    pub sessions: usize,
     pub backend: &'static str,
 }
 
 pub struct Entry {
     pub card: ModelCard,
     pub handle: ModelHandle,
+}
+
+/// Serving parameters a model is registered with, resolved from its passport
+/// or fixed for built-ins.
+#[derive(Clone, Copy)]
+pub struct Serving {
+    pub revision: u32,
+    pub max_batch: usize,
+    pub sessions: usize,
 }
 
 /// Name-to-model dispatch table, built once at startup. Registration spawns
@@ -54,8 +68,8 @@ impl Registry {
         &mut self,
         name: &str,
         backend: &'static str,
-        revision: u32,
-        max_batch: usize,
+        serving: Serving,
+        max_tokens: Option<usize>,
         engine: Arc<dyn Embedder>,
     ) {
         let card = ModelCard {
@@ -63,13 +77,16 @@ impl Registry {
             kind: ModelKind::Embedding,
             dim: Some(engine.dim()),
             n_features: None,
-            revision,
-            max_batch,
+            max_tokens,
+            revision: serving.revision,
+            max_batch: serving.max_batch,
+            sessions: serving.sessions,
             backend,
         };
         let handle = spawn_embed_worker(
             engine,
-            max_batch,
+            serving.max_batch,
+            serving.sessions,
             self.cache_entries,
             Arc::clone(&self.metrics),
         );
@@ -81,8 +98,8 @@ impl Registry {
         &mut self,
         name: &str,
         backend: &'static str,
-        revision: u32,
-        max_batch: usize,
+        serving: Serving,
+        max_tokens: Option<usize>,
         engine: Arc<dyn Reranker>,
     ) {
         let card = ModelCard {
@@ -90,11 +107,18 @@ impl Registry {
             kind: ModelKind::Rerank,
             dim: None,
             n_features: None,
-            revision,
-            max_batch,
+            max_tokens,
+            revision: serving.revision,
+            max_batch: serving.max_batch,
+            sessions: serving.sessions,
             backend,
         };
-        let handle = spawn_rerank_worker(engine, max_batch, Arc::clone(&self.metrics));
+        let handle = spawn_rerank_worker(
+            engine,
+            serving.max_batch,
+            serving.sessions,
+            Arc::clone(&self.metrics),
+        );
         self.entries
             .insert(name.to_string(), Entry { card, handle });
     }
@@ -103,8 +127,7 @@ impl Registry {
         &mut self,
         name: &str,
         backend: &'static str,
-        revision: u32,
-        max_batch: usize,
+        serving: Serving,
         engine: Arc<dyn Evaluator>,
     ) {
         let card = ModelCard {
@@ -112,11 +135,18 @@ impl Registry {
             kind: ModelKind::Tabular,
             dim: None,
             n_features: Some(engine.n_features()),
-            revision,
-            max_batch,
+            max_tokens: None,
+            revision: serving.revision,
+            max_batch: serving.max_batch,
+            sessions: serving.sessions,
             backend,
         };
-        let handle = spawn_evaluate_worker(engine, max_batch, Arc::clone(&self.metrics));
+        let handle = spawn_evaluate_worker(
+            engine,
+            serving.max_batch,
+            serving.sessions,
+            Arc::clone(&self.metrics),
+        );
         self.entries
             .insert(name.to_string(), Entry { card, handle });
     }
@@ -132,6 +162,7 @@ impl Registry {
             .collect();
         paths.sort();
 
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         for path in &paths {
             let passport = Passport::load(path)?;
             let model_dir = passport.resolved_dir(path);
@@ -139,45 +170,64 @@ impl Registry {
             passport
                 .verify(&model_dir)
                 .with_context(|| format!("passport {}", path.display()))?;
+            // Sessions beyond the core count add weight copies, not
+            // parallelism: with the thread budget split as cores/k, extra
+            // sessions would only oversubscribe. Capping beats refusing —
+            // a passport stays valid when it travels to a smaller host.
+            let requested_sessions = passport.effective_sessions();
+            let sessions = requested_sessions.min(cores);
+            if requested_sessions > sessions {
+                tracing::warn!(
+                    model = passport.name,
+                    requested = requested_sessions,
+                    cores,
+                    "sessions capped to the host's core count"
+                );
+            }
+            let serving = Serving {
+                revision: passport.revision,
+                max_batch: passport.effective_max_batch(),
+                sessions,
+            };
             match passport.kind {
                 ModelKind::Embedding => {
-                    let engine = OnnxEmbedder::load(&model_dir)
-                        .with_context(|| format!("loading `{}`", passport.name))?;
+                    let engine =
+                        OnnxEmbedder::load(&model_dir, serving.sessions, passport.max_tokens)
+                            .with_context(|| format!("loading `{}`", passport.name))?;
+                    let max_tokens = engine.max_tokens();
                     self.register_embedder(
                         &passport.name,
                         "onnx",
-                        passport.revision,
-                        passport.max_batch,
+                        serving,
+                        Some(max_tokens),
                         Arc::new(engine),
                     );
                 }
                 ModelKind::Rerank => {
-                    let engine = OnnxCrossEncoder::load(&model_dir)
-                        .with_context(|| format!("loading `{}`", passport.name))?;
+                    let engine =
+                        OnnxCrossEncoder::load(&model_dir, serving.sessions, passport.max_tokens)
+                            .with_context(|| format!("loading `{}`", passport.name))?;
+                    let max_tokens = engine.max_tokens();
                     self.register_reranker(
                         &passport.name,
                         "onnx",
-                        passport.revision,
-                        passport.max_batch,
+                        serving,
+                        Some(max_tokens),
                         Arc::new(engine),
                     );
                 }
                 ModelKind::Tabular => {
-                    let engine = OnnxTabular::load(&model_dir)
+                    let engine = OnnxTabular::load(&model_dir, serving.sessions)
                         .with_context(|| format!("loading `{}`", passport.name))?;
-                    self.register_evaluator(
-                        &passport.name,
-                        "onnx",
-                        passport.revision,
-                        passport.max_batch,
-                        Arc::new(engine),
-                    );
+                    self.register_evaluator(&passport.name, "onnx", serving, Arc::new(engine));
                 }
             }
             tracing::info!(
                 model = passport.name,
                 kind = ?passport.kind,
                 revision = passport.revision,
+                max_batch = serving.max_batch,
+                sessions = serving.sessions,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "model verified and loaded"
             );
