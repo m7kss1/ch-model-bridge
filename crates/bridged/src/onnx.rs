@@ -197,7 +197,16 @@ impl LoadedModel {
 
         let (shape, data) = self.pool.with(|session| -> anyhow::Result<_> {
             let run_result = if self.needs_token_type_ids {
-                let type_ids = tensor(vec![0i64; batch * seq])?;
+                // The segment ids come from the encoding: pair inputs mark the
+                // document side as segment 1, and BERT-family cross-encoders
+                // score against that boundary. An all-zero stand-in does not
+                // fail, it silently degrades every score. (XLM-R tokenizers
+                // emit all zeros here, so for them this is the same tensor.)
+                let mut type_ids = Vec::with_capacity(batch * seq);
+                for encoding in encodings {
+                    type_ids.extend(encoding.get_type_ids().iter().map(|&t| t as i64));
+                }
+                let type_ids = tensor(type_ids)?;
                 session.run(ort::inputs![
                     "input_ids" => ids_tensor,
                     "attention_mask" => mask_tensor,
