@@ -2,7 +2,7 @@
 # must not change the demo model or redden CI on its own schedule. Dependabot
 # bumps these weekly, and the CI model cache key hashes this file, so a bump
 # retrains the demo and regenerates the reference scores together.
-numpy==2.5.2
+numpy==2.5.3
 onnx==1.22.0
-scikit-learn==1.9.0
+scikit-learn==1.9.1
 skl2onnx==1.20.0
