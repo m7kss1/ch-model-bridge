@@ -5,7 +5,7 @@
 # glibc 2.38+ and links `__isoc23_strtoll`, so bookworm (2.36) fails at link
 # time. Bases are pinned by digest and kept current by Dependabot; the tag in
 # the comment is what the digest resolved from.
-FROM rust:1.98-trixie@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 AS builder
+FROM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS builder
 
 ENV CARGO_TERM_COLOR=never \
     CARGO_INCREMENTAL=0 \
